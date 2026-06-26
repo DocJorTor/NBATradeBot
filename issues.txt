@@ -1,0 +1,41 @@
+Known Issues
+- Issue with importing prices above $999 (comma issue with data)
+
+
+Need to add
+- When listing is claimed/accepted bid, create chat with bot, seller and buyer for immediate contact.
+
+
+Future nice to haves
+- Bulk listing ability
+- Expanded results/dynamic similar results for price command
+
+
+
+Fixed Issues-
+- Missing subsets
+    - The Man from Topps Finest, Pulse from Topps Chrome Sapphire, ...
+- Issue with ' characters on mobile/pc.
+- Unable to edit or delete listing
+- Logging for all bot actions, params used. High event level for empty searches or any failed interactions.
+- Secondary channel where messaging is restricted. Listings will be surfaced here.
+- Listed by seller name is discord user name and should also show server nickname for clarity.
+- Integration with main sheet
+- Added record_transaction for adding to sheet from non listings
+- Added payment platform info on listings, can be saved to user
+- Auto name formatting so user input does not matter
+- Active bids do not show in /status
+- Bid message does not go away after accepted/declined.
+- Ocassionaly a photo will appear to not be removed after listing, but only the lister sees this.
+- Issue with Bid Modal exception (*further research needed)
+- Editing price bumps listing
+- /notify to allow for non player centric notifications
+- Auction Functionality
+
+
+Notes from Beta
+- Still some people using #want-to-sell that seemingly did not interact with channel.
+- Some people had issues using the command and used other bot's help command.
+- Some of the cut features (price trend and record transaction) were asked about. Will look further into adding back.
+- Lots of positive feedback. Many different people using the listings.
+

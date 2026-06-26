@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+*.pyd
+.env
+config.json
+*.db
+*.sqlite3
+service_account.json
+logs.txt
