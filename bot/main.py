@@ -28,10 +28,13 @@ def _env_config() -> dict:
         "discord_sale_channel_id": os.getenv("DISCORD_SALE_CHANNEL_ID", ""),
         "discord_listing_surface_channel_id": os.getenv("DISCORD_LISTING_SURFACE_CHANNEL_ID", ""),
         "discord_auction_surface_channel_id": os.getenv("DISCORD_AUCTION_SURFACE_CHANNEL_ID", ""),
+        "discord_bot_channel_id": os.getenv("DISCORD_BOT_CHANNEL_ID", ""),
+        "discord_bot_channel_name": os.getenv("DISCORD_BOT_CHANNEL_NAME", "nba-bot"),
         "mod_channel_id": os.getenv("DISCORD_MOD_CHANNEL_ID", ""),
         "discord_guild_id": os.getenv("DISCORD_GUILD_ID", ""),
         "database_path": os.getenv("DATABASE_PATH", "cards.db"),
         "disable_sheets": _env_bool("DISABLE_SHEETS", False),
+        "restore_visible_listing_messages_on_startup": _env_bool("RESTORE_VISIBLE_LISTING_MESSAGES_ON_STARTUP", False),
         "google_sheets": {
             "spreadsheet_id": os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", ""),
             "credentials_file": os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "bot/service_account.json"),

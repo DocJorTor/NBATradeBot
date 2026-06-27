@@ -44,7 +44,7 @@ def _mention_user(user: discord.abc.User) -> str:
 class ClaimReminderView(ClaimedListingView):
     """Seller reminder controls for a claimed listing."""
 
-    @ui.button(label="Notify Buyer", style=discord.ButtonStyle.blurple, custom_id="claim_reminder:notify_buyer")
+    @ui.button(label="🔔 Notify Buyer", style=discord.ButtonStyle.blurple, custom_id="claim_reminder:notify_buyer")
     async def notify_buyer(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.listing_data["seller_id"]:
             await interaction.response.send_message("Only the seller can notify the buyer.", ephemeral=True)
@@ -113,6 +113,8 @@ class NBACollectBot(discord.Client):
         self._hydrated_users: Dict[int, discord.abc.User] = {}
         self._marketplace_state_restored = False
         self._claim_reminder_task = None
+        self._bot_interface_message_id = None
+        self.bot_interface_view_factory = None
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -130,6 +132,100 @@ class NBACollectBot(discord.Client):
             except Exception:
                 LOGGER.exception("Claim reminder loop failed")
             await asyncio.sleep(60 * 60)
+
+    def _active_marketplace_listings(self) -> list[dict]:
+        listings = [
+            listing
+            for listing in (self.active_listings or {}).values()
+            if str(listing.get("status", "active")).lower() in {"active", "open"}
+        ]
+        listings.sort(
+            key=lambda listing: (
+                str(listing.get("date_time") or ""),
+                int(listing.get("message_id") or 0),
+            ),
+            reverse=True,
+        )
+        return listings
+
+    def build_bot_interface_view(self) -> ui.View | None:
+        if self.bot_interface_view_factory is None:
+            return None
+        return self.bot_interface_view_factory()
+
+    async def _find_interface_message(self, channel, marker_title: str):
+        async for message in channel.history(limit=25):
+            if self.user is not None and getattr(message.author, "id", None) != self.user.id:
+                continue
+            content = message.content.strip()
+            if content == marker_title or content.startswith(f"**{marker_title}**"):
+                return message
+            if marker_title == "NBA Bot" and any(
+                getattr(component, "custom_id", None) == "nba_bot:list_player"
+                for component in getattr(message, "components", [])
+                for component in getattr(component, "children", [])
+            ):
+                return message
+            for embed in message.embeds:
+                if embed.title == marker_title:
+                    return message
+        return None
+
+    async def resolve_nba_bot_channel(self):
+        channel_id = self.config.get("discord_bot_channel_id")
+        if channel_id:
+            return await self.fetch_channel_safely(channel_id)
+
+        channel_name = str(self.config.get("discord_bot_channel_name") or "nba-bot").lstrip("#")
+        for guild in self.guilds:
+            channel = discord.utils.get(guild.text_channels, name=channel_name)
+            if channel is not None:
+                return channel
+        return None
+
+    async def ensure_nba_bot_interfaces(self) -> None:
+        if not (self.config.get("discord_bot_channel_id") or self.config.get("discord_bot_channel_name")):
+            return
+        channel = await self.resolve_nba_bot_channel()
+        if channel is None:
+            LOGGER.warning("Configured NBA bot channel could not be found.")
+            return
+
+        bot_message_id = self.db.get_metadata("nba_bot_interface_message_id")
+        bot_message = await self.fetch_listing_message(channel.id, bot_message_id) if bot_message_id else None
+        if bot_message in (None, UNAVAILABLE_MESSAGE):
+            bot_message = await self._find_interface_message(channel, "NBA Bot")
+        if bot_message is None:
+            bot_message = await channel.send(
+                content="\u200b",
+                view=self.build_bot_interface_view(),
+            )
+        else:
+            await bot_message.edit(
+                content="\u200b",
+                embed=None,
+                view=self.build_bot_interface_view(),
+            )
+        self._bot_interface_message_id = bot_message.id
+        self.db.set_metadata("nba_bot_interface_message_id", str(bot_message.id))
+        await self.cleanup_legacy_marketplace_interface(channel)
+
+    async def cleanup_legacy_marketplace_interface(self, channel) -> None:
+        legacy_message_id = self.db.get_metadata("nba_bot_marketplace_message_id")
+        legacy_message = await self.fetch_listing_message(channel.id, legacy_message_id) if legacy_message_id else None
+        if legacy_message in (None, UNAVAILABLE_MESSAGE):
+            legacy_message = await self._find_interface_message(channel, "Marketplace")
+        if legacy_message in (None, UNAVAILABLE_MESSAGE):
+            return
+        try:
+            await legacy_message.delete()
+            LOGGER.info("Deleted legacy marketplace interface message %s.", legacy_message.id)
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            LOGGER.warning("Could not delete legacy marketplace interface message %s: missing permissions.", legacy_message.id)
+        except discord.DiscordException:
+            LOGGER.exception("Could not delete legacy marketplace interface message %s.", legacy_message.id)
 
     def _claim_reminder_sent(self, listing_id: int, stage: str) -> bool:
         stage_order = {
@@ -298,7 +394,11 @@ class NBACollectBot(discord.Client):
         stale_auctions_removed = await self.cleanup_stale_auctions_on_startup()
         restored_listings = 0
         repaired_listings = 0
+        deferred_visible_repairs = 0
         removed_listings = 0
+        restore_visible_messages = bool(
+            self.config.get("restore_visible_listing_messages_on_startup", False)
+        )
         for listing in self.db.get_open_marketplace_listings():
             seller = await self.hydrate_user(
                 listing["seller_id"],
@@ -349,9 +449,11 @@ class NBACollectBot(discord.Client):
             stored_image_url = listing.get("image_url")
             stored_surface_image_url = listing.get("surface_image_url")
             image_repaired = False
-            if status == "active":
+            if status == "active" and restore_visible_messages:
                 await self.ensure_listing_image_asset(listing)
             if (
+                restore_visible_messages
+                and
                 status == "active"
                 and (
                     not stored_image_url
@@ -375,6 +477,8 @@ class NBACollectBot(discord.Client):
                 )
             )
             surface_missing_image = (
+                restore_visible_messages
+                and
                 status == "active"
                 and self.listing_surface_should_exist(listing)
                 and surface_message not in (None, UNAVAILABLE_MESSAGE)
@@ -386,15 +490,15 @@ class NBACollectBot(discord.Client):
                     )
                 )
             )
-            if image_repaired or primary_missing_image or surface_missing_image:
+            if restore_visible_messages and (image_repaired or primary_missing_image or surface_missing_image):
                 resolved_image_url = await self.ensure_listing_image_url(listing)
                 if resolved_image_url:
+                    self.db.upsert_marketplace_listing(listing)
                     await self.edit_listing_messages(
                         listing,
                         embed=build_listing_embed(listing),
                         view=view_cls(self, self.db, listing),
                     )
-                    self.db.upsert_marketplace_listing(listing)
                     if not image_repaired:
                         repaired_listings += 1
                     log_marketplace_event(
@@ -408,8 +512,17 @@ class NBACollectBot(discord.Client):
                             "data_repaired": image_repaired,
                         },
                     )
+            elif (
+                not restore_visible_messages
+                and status == "active"
+                and primary_message not in (None, UNAVAILABLE_MESSAGE)
+                and not self.message_has_visible_image(primary_message)
+            ):
+                deferred_visible_repairs += 1
 
             if (
+                restore_visible_messages
+                and
                 status == "active"
                 and self.listing_surface_should_exist(listing)
                 and surface_message is None
@@ -438,6 +551,7 @@ class NBACollectBot(discord.Client):
                 and self.listing_surface_should_exist(listing)
                 and surface_message not in (None, UNAVAILABLE_MESSAGE)
                 and not self.message_has_visible_image(surface_message)
+                and restore_visible_messages
             ):
                 resolved_image_url = await self.ensure_listing_image_url(listing)
                 if resolved_image_url:
@@ -466,7 +580,11 @@ class NBACollectBot(discord.Client):
                 await self.restore_deal_thread_action_view(listing)
             elif listing.get("deal_thread_id"):
                 await self.close_deal_thread_action_messages(listing)
-            if listing.get("listing_type") == "auction" and status == "active":
+            if (
+                restore_visible_messages
+                and listing.get("listing_type") == "auction"
+                and status == "active"
+            ):
                 await self.edit_listing_messages(
                     listing,
                     embed=build_listing_embed(listing),
@@ -509,9 +627,10 @@ class NBACollectBot(discord.Client):
 
         self._marketplace_state_restored = True
         LOGGER.info(
-            "Restored %s marketplace listing(s), repaired %s, removed %s stale listing(s), and restored %s notify rule(s).",
+            "Restored %s marketplace listing(s), repaired %s, deferred %s visible repair(s), removed %s stale listing(s), and restored %s notify rule(s).",
             restored_listings,
             repaired_listings,
+            deferred_visible_repairs,
             removed_listings + stale_auctions_removed,
             len(self.notify_rules),
         )
@@ -1580,6 +1699,7 @@ def main():
         guild = discord.Object(id=int(config["discord_guild_id"]))
         await bot.tree.sync(guild=guild)
         await bot.restore_marketplace_state()
+        await bot.ensure_nba_bot_interfaces()
         bot.start_claim_reminder_loop()
         LOGGER.info("Discord bot is ready.")
 

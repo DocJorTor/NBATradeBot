@@ -36,7 +36,7 @@ from serializers import build_listing_embed, format_card_count, highest_active_b
 class DisabledListingView(ui.View):
     """Disabled version of listing buttons after a listing is closed."""
 
-    def __init__(self, primary_label: str = "Claimed", secondary_label: str = "Offers Closed"):
+    def __init__(self, primary_label: str = "✅ Claimed", secondary_label: str = "🔒 Offers Closed"):
         super().__init__(timeout=None)
         self.primary_label = primary_label
         self.secondary_label = secondary_label
@@ -44,12 +44,12 @@ class DisabledListingView(ui.View):
             self.children[0].label = primary_label
             self.children[1].label = secondary_label
 
-    @ui.button(label="Closed", style=discord.ButtonStyle.grey, disabled=True, custom_id="listing:closed")
+    @ui.button(label="🔒 Closed", style=discord.ButtonStyle.grey, disabled=True, custom_id="listing:closed")
     async def claimed_button(self, interaction: discord.Interaction, button: ui.Button):
         button.label = self.primary_label
         await interaction.response.defer()
 
-    @ui.button(label="Bidding Closed", style=discord.ButtonStyle.grey, disabled=True, custom_id="listing:bidding_closed")
+    @ui.button(label="🔒 Bidding Closed", style=discord.ButtonStyle.grey, disabled=True, custom_id="listing:bidding_closed")
     async def bidding_closed_button(self, interaction: discord.Interaction, button: ui.Button):
         button.label = self.secondary_label
         await interaction.response.defer()
@@ -214,8 +214,9 @@ class MarketplaceCarouselView(ui.View):
         listings: list[Dict[str, Any]],
         *,
         owner_id: int | None = None,
+        timeout: float | None = 300,
     ):
-        super().__init__(timeout=300)
+        super().__init__(timeout=timeout)
         self.bot = bot
         self.db = db
         self.owner_id = owner_id
@@ -517,7 +518,7 @@ class MarketplaceCarouselView(ui.View):
                     ephemeral=True,
                 )
 
-    @ui.button(label="Previous Listing", style=discord.ButtonStyle.secondary, row=3, custom_id="marketplace:prev")
+    @ui.button(label="⬅️ Previous Listing", style=discord.ButtonStyle.secondary, row=3, custom_id="marketplace:prev")
     async def previous_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -525,7 +526,7 @@ class MarketplaceCarouselView(ui.View):
             self.index = (self.index - 1) % len(self.listings)
         await self._edit(interaction)
 
-    @ui.button(label="Next Listing", style=discord.ButtonStyle.secondary, row=3, custom_id="marketplace:next")
+    @ui.button(label="Next Listing ➡️", style=discord.ButtonStyle.secondary, row=3, custom_id="marketplace:next")
     async def next_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -556,14 +557,14 @@ class MarketplaceCarouselView(ui.View):
         self.reset_to_first_on_refresh = True
         await self._edit(interaction)
 
-    @ui.button(label="Previous Players Page", style=discord.ButtonStyle.secondary, row=1, custom_id="marketplace:player_prev")
+    @ui.button(label="⬅️ Players Page", style=discord.ButtonStyle.secondary, row=1, custom_id="marketplace:player_prev")
     async def player_prev_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
         self.player_page = max(0, self.player_page - 1)
         await self._edit(interaction)
 
-    @ui.button(label="Next Players Page", style=discord.ButtonStyle.secondary, row=1, custom_id="marketplace:player_next")
+    @ui.button(label="Players Page ➡️", style=discord.ButtonStyle.secondary, row=1, custom_id="marketplace:player_next")
     async def player_next_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -571,7 +572,7 @@ class MarketplaceCarouselView(ui.View):
             self.player_page += 1
         await self._edit(interaction)
 
-    @ui.button(label="Card Actions", style=discord.ButtonStyle.blurple, row=4, custom_id="marketplace:actions")
+    @ui.button(label="🃏 Card Actions", style=discord.ButtonStyle.blurple, row=4, custom_id="marketplace:actions")
     async def actions_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -979,7 +980,7 @@ class EditListingWorkflowView(ui.View):
         self.add_item(self.card_count_select)
 
         self.details_button = ui.Button(
-            label="Price / Payment",
+            label="💳 Price / Payment",
             style=discord.ButtonStyle.blurple,
             row=4,
         )
@@ -987,7 +988,7 @@ class EditListingWorkflowView(ui.View):
         self.add_item(self.details_button)
 
         self.save_button = ui.Button(
-            label="Save Listing",
+            label="💾 Save Listing",
             style=discord.ButtonStyle.green,
             row=4,
         )
@@ -1113,7 +1114,7 @@ class SetSubsetSelectView(ui.View):
         self.selected_subset = select.values[0]
         await interaction.response.defer()
 
-    @ui.button(label="Continue to List Card", style=discord.ButtonStyle.green)
+    @ui.button(label="➡️ Continue to List Card", style=discord.ButtonStyle.green)
     async def continue_button(self, interaction: discord.Interaction, button: ui.Button):
         if not self.selected_set or not self.selected_subset:
             await interaction.response.send_message("Please select both set and subset.", ephemeral=True)
@@ -1259,9 +1260,9 @@ class BidPromptView(ui.View):
         self.auction = auction
         for child in self.children:
             if getattr(child, "custom_id", None) == "bid_prompt:continue":
-                child.label = "Continue to Bid" if auction else "Continue to Offer"
+                child.label = "➡️ Continue to Bid" if auction else "➡️ Continue to Offer"
 
-    @ui.button(label="Continue to Bid", style=discord.ButtonStyle.blurple, custom_id="bid_prompt:continue")
+    @ui.button(label="➡️ Continue to Bid", style=discord.ButtonStyle.blurple, custom_id="bid_prompt:continue")
     async def continue_button(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.bidder.id:
             action = "bid prompt" if self.auction else "offer prompt"
@@ -1295,7 +1296,7 @@ class BidPromptView(ui.View):
             )
         await interaction.response.send_modal(modal)
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.grey, custom_id="bid_prompt:cancel")
+    @ui.button(label="✖️ Cancel", style=discord.ButtonStyle.grey, custom_id="bid_prompt:cancel")
     async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.bidder.id:
             action = "bid prompt" if self.auction else "offer prompt"
@@ -1329,7 +1330,7 @@ class ListingActionView(ui.View):
             return
 
         button = ui.Button(
-            label="Price Assist",
+            label="💡 Price Assist",
             style=discord.ButtonStyle.secondary,
             row=2,
             custom_id="listing:price_assist",
@@ -1360,7 +1361,7 @@ class ListingActionView(ui.View):
         )
         return True
 
-    @ui.button(label="Claim", style=discord.ButtonStyle.green, custom_id="listing:claim")
+    @ui.button(label="✅ Claim", style=discord.ButtonStyle.green, custom_id="listing:claim")
     async def claim_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_inactive(interaction):
             return
@@ -1385,7 +1386,7 @@ class ListingActionView(ui.View):
         confirm_view = ConfirmPurchaseView(self.bot, self.db, self.listing_data)
         await interaction.response.send_message(embed=embed, view=confirm_view, ephemeral=True)
 
-    @ui.button(label="Make an Offer", style=discord.ButtonStyle.blurple, custom_id="listing:bid")
+    @ui.button(label="💬 Make an Offer", style=discord.ButtonStyle.blurple, custom_id="listing:bid")
     async def bid_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_inactive(interaction):
             return
@@ -1459,7 +1460,7 @@ class ListingActionView(ui.View):
         )
         return True
 
-    @ui.button(label="Edit Listing", style=discord.ButtonStyle.grey, row=1, custom_id="listing:edit")
+    @ui.button(label="✏️ Edit Listing", style=discord.ButtonStyle.grey, row=1, custom_id="listing:edit")
     async def edit_listing_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_inactive(interaction):
             return
@@ -1473,7 +1474,7 @@ class ListingActionView(ui.View):
             ephemeral=True,
         )
 
-    @ui.button(label="Remove Listing", style=discord.ButtonStyle.red, row=1, custom_id="listing:remove")
+    @ui.button(label="🗑️ Remove Listing", style=discord.ButtonStyle.red, row=1, custom_id="listing:remove")
     async def remove_listing_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_inactive(interaction):
             return
@@ -1509,7 +1510,7 @@ class AuctionActionView(ui.View):
         if self.listing_data.get("listing_type") == "auction":
             for child in self.children:
                 if getattr(child, "custom_id", None) == "claimed:cancel":
-                    child.label = "Auction Locked"
+                    child.label = "🔒 Auction Locked"
                     child.disabled = True
         self._sync_button_state()
 
@@ -1523,7 +1524,7 @@ class AuctionActionView(ui.View):
             if getattr(child, "custom_id", None) == "auction:bid":
                 child.disabled = ended or self.listing_data.get("status") != "active"
             if getattr(child, "custom_id", None) == "auction:end":
-                child.label = "Finalize Auction"
+                child.label = "🏁 Finalize Auction"
                 child.disabled = self.listing_data.get("status") != "active"
             if getattr(child, "custom_id", None) == "auction:remove":
                 child.disabled = not can_remove or self.listing_data.get("status") != "active"
@@ -1545,7 +1546,7 @@ class AuctionActionView(ui.View):
         await interaction.response.send_message("Only the seller can manage this auction.", ephemeral=True)
         return True
 
-    @ui.button(label="Place Bid", style=discord.ButtonStyle.blurple, custom_id="auction:bid")
+    @ui.button(label="💸 Place Bid", style=discord.ButtonStyle.blurple, custom_id="auction:bid")
     async def bid_button(self, interaction: discord.Interaction, button: ui.Button):
         if self.listing_data.get("status") != "active":
             await interaction.response.send_message("This auction is no longer active.", ephemeral=True)
@@ -1574,7 +1575,7 @@ class AuctionActionView(ui.View):
             ephemeral=True,
         )
 
-    @ui.button(label="Finalize Auction", style=discord.ButtonStyle.green, custom_id="auction:end")
+    @ui.button(label="🏁 Finalize Auction", style=discord.ButtonStyle.green, custom_id="auction:end")
     async def end_auction_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_not_seller(interaction):
             return
@@ -1594,7 +1595,7 @@ class AuctionActionView(ui.View):
             await self.bot.edit_listing_messages(
                 self.listing_data,
                 embed=build_listing_embed(self.listing_data),
-                view=DisabledListingView(primary_label="Auction Ended", secondary_label="No Winner"),
+                view=DisabledListingView(primary_label="🏁 Auction Ended", secondary_label="🚫 No Winner"),
             )
             self.db.update_marketplace_listing_status(self.listing_data["message_id"], "removed")
             log_marketplace_event(
@@ -1625,7 +1626,7 @@ class AuctionActionView(ui.View):
             return
         await interaction.followup.send("Auction ended. The high bidder has been notified.", ephemeral=True)
 
-    @ui.button(label="Remove Auction", style=discord.ButtonStyle.red, row=1, custom_id="auction:remove")
+    @ui.button(label="🗑️ Remove Auction", style=discord.ButtonStyle.red, row=1, custom_id="auction:remove")
     async def remove_auction_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_not_seller(interaction):
             return
@@ -2248,7 +2249,7 @@ class ConfirmPurchaseView(ui.View):
         )
         LOGGER.exception("Claim flow failed")
 
-    @ui.button(label="Confirm Purchase", style=discord.ButtonStyle.green, custom_id="claim:confirm")
+    @ui.button(label="✅ Confirm Purchase", style=discord.ButtonStyle.green, custom_id="claim:confirm")
     async def confirm(self, interaction: discord.Interaction, button: ui.Button):
         if self.listing_data.get("status") != "active":
             await interaction.response.send_message(
@@ -2367,7 +2368,7 @@ class ConfirmPurchaseView(ui.View):
         await interaction.edit_original_response(content=message, embed=None, view=None)
         self.stop()
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.red, custom_id="claim:cancel")
+    @ui.button(label="✖️ Cancel", style=discord.ButtonStyle.red, custom_id="claim:cancel")
     async def cancel(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content="Purchase cancelled.", view=None)
         self.stop()
@@ -2379,11 +2380,11 @@ class DisabledClaimedListingActionView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @ui.button(label="Record Transaction", style=discord.ButtonStyle.grey, disabled=True, custom_id="claimed:record:closed")
+    @ui.button(label="🧾 Record Transaction", style=discord.ButtonStyle.grey, disabled=True, custom_id="claimed:record:closed")
     async def record_transaction_closed(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
 
-    @ui.button(label="Cancel Claim", style=discord.ButtonStyle.grey, disabled=True, custom_id="claimed:cancel:closed")
+    @ui.button(label="✖️ Cancel Claim", style=discord.ButtonStyle.grey, disabled=True, custom_id="claimed:cancel:closed")
     async def cancel_claim_closed(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
 
@@ -2452,7 +2453,7 @@ class ClaimedListingView(ui.View):
         )
         return True
 
-    @ui.button(label="Record Transaction", style=discord.ButtonStyle.green, custom_id="claimed:record")
+    @ui.button(label="🧾 Record Transaction", style=discord.ButtonStyle.green, custom_id="claimed:record")
     async def record_transaction(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_claim_actions_closed(interaction):
             return
@@ -2511,7 +2512,7 @@ class ClaimedListingView(ui.View):
                 reason="Marketplace transaction recorded",
             )
 
-    @ui.button(label="Cancel Claim", style=discord.ButtonStyle.red, custom_id="claimed:cancel")
+    @ui.button(label="✖️ Cancel Claim", style=discord.ButtonStyle.red, custom_id="claimed:cancel")
     async def cancel_claim(self, interaction: discord.Interaction, button: ui.Button):
         if await self.reject_if_claim_actions_closed(interaction):
             return
@@ -2612,7 +2613,7 @@ class CounterOfferView(ui.View):
         )
         LOGGER.exception("Counter offer decision failed")
 
-    @ui.button(label="Accept Counter", style=discord.ButtonStyle.green, custom_id="counter:accept")
+    @ui.button(label="✅ Accept Counter", style=discord.ButtonStyle.green, custom_id="counter:accept")
     async def accept_counter(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.bidder.id:
             await interaction.response.send_message("Only the buyer can accept this counter offer.", ephemeral=True)
@@ -2652,7 +2653,7 @@ class CounterOfferView(ui.View):
         await self.close_counter_message(interaction, "Counter accepted. The listing is now claimed.")
         self.stop()
 
-    @ui.button(label="Decline Counter", style=discord.ButtonStyle.red, custom_id="counter:decline")
+    @ui.button(label="✖️ Decline Counter", style=discord.ButtonStyle.red, custom_id="counter:decline")
     async def decline_counter(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.bidder.id:
             await interaction.response.send_message("Only the buyer can decline this counter offer.", ephemeral=True)
@@ -2880,7 +2881,7 @@ class AcceptBidView(ui.View):
         )
         LOGGER.exception("Offer decision failed")
 
-    @ui.button(label="Accept Offer", style=discord.ButtonStyle.green, custom_id="bid:accept")
+    @ui.button(label="✅ Accept Offer", style=discord.ButtonStyle.green, custom_id="bid:accept")
     async def accept_bid(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.listing_data["seller_id"]:
             await interaction.response.send_message("Only the seller can accept offers.", ephemeral=True)
@@ -2913,7 +2914,7 @@ class AcceptBidView(ui.View):
         await self.close_bid_message(interaction, "Offer accepted. The listing is now claimed.")
         self.stop()
 
-    @ui.button(label="Counter Offer", style=discord.ButtonStyle.blurple, custom_id="bid:counter")
+    @ui.button(label="↩️ Counter Offer", style=discord.ButtonStyle.blurple, custom_id="bid:counter")
     async def counter_offer(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.listing_data["seller_id"]:
             await interaction.response.send_message("Only the seller can counter offers.", ephemeral=True)
@@ -2938,7 +2939,7 @@ class AcceptBidView(ui.View):
             )
         )
 
-    @ui.button(label="Decline Offer", style=discord.ButtonStyle.red, custom_id="bid:decline")
+    @ui.button(label="✖️ Decline Offer", style=discord.ButtonStyle.red, custom_id="bid:decline")
     async def decline_bid(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.listing_data["seller_id"]:
             await interaction.response.send_message("Only the seller can decline offers.", ephemeral=True)

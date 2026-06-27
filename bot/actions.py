@@ -32,15 +32,19 @@ async def collect_listing_image(
     db,
     interaction: discord.Interaction,
     upload_prompt: discord.Message = None,
+    upload_channel: discord.abc.Messageable = None,
 ) -> tuple[str | None, discord.File | None, bytes | None]:
     image_url = None
     image_file = None
     image_bytes = None
 
+    target_channel = upload_channel or interaction.channel
+    target_channel_id = getattr(target_channel, "id", None)
+
     def check(msg: discord.Message):
         return (
             msg.author.id == interaction.user.id
-            and msg.channel.id == interaction.channel.id
+            and msg.channel.id == target_channel_id
             and len(msg.attachments) > 0
         )
 
@@ -68,7 +72,10 @@ async def collect_listing_image(
             )
             image_url = "attachment://card_image.png"
 
-        deleted_upload = await delete_message_if_possible(msg, interaction)
+        if getattr(msg.channel, "type", None) == discord.ChannelType.private:
+            deleted_upload = False
+        else:
+            deleted_upload = await delete_message_if_possible(msg, interaction)
         log_marketplace_event(
             db,
             "listing_upload_message_cleanup",

@@ -155,12 +155,12 @@ class SubsetSearchModal(discord.ui.Modal, title="Search Subset"):
 
 def add_search_buttons(view, *, row: int = 4) -> None:
     set_button = discord.ui.Button(
-        label="Search Set",
+        label="🔎 Search Set",
         style=discord.ButtonStyle.secondary,
         row=row,
     )
     subset_button = discord.ui.Button(
-        label="Search Subset",
+        label="🔎 Search Subset",
         style=discord.ButtonStyle.secondary,
         row=row,
     )

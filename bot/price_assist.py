@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import discord
 from discord import ui
@@ -173,17 +173,19 @@ class PriceResultsView(ui.View):
         owner_id: int,
         heading: str,
         range_label: str | None = None,
+        save_callback: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ):
         super().__init__(timeout=180)
         self.results = results
         self.owner_id = owner_id
         self.heading = heading
         self.range_label = range_label
+        self.save_callback = save_callback
         self.page = 0
         self.page_count = max(1, (len(results) + self.page_size - 1) // self.page_size)
 
         self.prev_button = ui.Button(
-            label="Previous",
+            label="⬅️ Previous",
             style=discord.ButtonStyle.secondary,
             row=0,
             disabled=True,
@@ -192,13 +194,22 @@ class PriceResultsView(ui.View):
         self.add_item(self.prev_button)
 
         self.next_button = ui.Button(
-            label="Next",
+            label="Next ➡️",
             style=discord.ButtonStyle.secondary,
             row=0,
             disabled=self.page_count <= 1,
         )
         self.next_button.callback = self.on_next
         self.add_item(self.next_button)
+
+        if self.save_callback is not None:
+            self.save_button = ui.Button(
+                label="🔔 Save Notification",
+                style=discord.ButtonStyle.green,
+                row=1,
+            )
+            self.save_button.callback = self.on_save
+            self.add_item(self.save_button)
 
     async def _reject_wrong_user(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -284,3 +295,14 @@ class PriceResultsView(ui.View):
             embeds=self.embeds(),
             view=self,
         )
+
+    async def on_save(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        if self.save_callback is None:
+            await interaction.response.send_message(
+                "This price search cannot be saved as a notification.",
+                ephemeral=True,
+            )
+            return
+        await self.save_callback(interaction)

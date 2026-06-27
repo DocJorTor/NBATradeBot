@@ -285,6 +285,68 @@ def _notify_rule_option_text(rule: dict) -> tuple[str, str]:
     return label[:100], description[:100]
 
 
+def _notify_rules_match(left: dict, right: dict) -> bool:
+    return (
+        int(left.get("user_id")) == int(right.get("user_id"))
+        and str(left.get("player_name") or "") == str(right.get("player_name") or "")
+        and (left.get("set_name") or None) == (right.get("set_name") or None)
+        and (left.get("subset") or None) == (right.get("subset") or None)
+        and (
+            None if left.get("card_count") in ("", ANY_VALUE) else str(left.get("card_count"))
+        ) == (
+            None if right.get("card_count") in ("", ANY_VALUE) else str(right.get("card_count"))
+        )
+    )
+
+
+async def _save_notify_rule_from_filters(
+    bot: "NBACollectBot",
+    db: CardDatabase,
+    interaction: discord.Interaction,
+    rule: dict,
+    *,
+    event_type: str,
+    edit_response: bool = False,
+) -> None:
+    if not any(rule.get(key) not in (None, "", ANY_VALUE) for key in ("player_name", "set_name", "subset", "card_count")):
+        message = "Choose at least one filter before saving a notification."
+        if edit_response:
+            await interaction.response.edit_message(content=message, view=None)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    for active_rule in getattr(bot, "notify_rules", []) or []:
+        if _notify_rules_match(active_rule, rule):
+            message = f"You already have this notification:\n{_notify_rule_line(active_rule)}"
+            if edit_response:
+                await interaction.response.edit_message(content=message, view=None)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+    rule = dict(rule)
+    rule["id"] = db.add_notify_rule(rule)
+    bot.notify_rules.append(rule)
+    log_marketplace_event(
+        db,
+        event_type,
+        user_id=interaction.user.id,
+        details={
+            "player": rule.get("player_name") or None,
+            "set_name": rule.get("set_name"),
+            "subset": rule.get("subset"),
+            "card_count": rule.get("card_count"),
+        },
+        level=20,
+    )
+    message = f"Notification saved:\n{_notify_rule_line(rule)}"
+    if edit_response:
+        await interaction.response.edit_message(content=message, view=None)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 def _join_or_empty(
     lines: list[str],
     empty_message: str,
@@ -495,7 +557,7 @@ class StatusActionsView(ui.View):
             ephemeral=True,
         )
 
-    @ui.button(label="Listing Actions", style=discord.ButtonStyle.blurple, custom_id="status:listing_actions")
+    @ui.button(label="📝 Listing Actions", style=discord.ButtonStyle.blurple, custom_id="status:listing_actions")
     async def listing_actions_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -521,7 +583,7 @@ class StatusActionsView(ui.View):
             ephemeral=True,
         )
 
-    @ui.button(label="Claimed Listing Actions", style=discord.ButtonStyle.green, custom_id="status:claimed_listing_actions")
+    @ui.button(label="✅ Claimed Listing Actions", style=discord.ButtonStyle.green, custom_id="status:claimed_listing_actions")
     async def claimed_listing_actions_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -567,7 +629,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
 
     @bot.tree.command(
         name="help",
-        description="View all NBA Trade Bot commands.",
+        description="View the NBA Trade Bot button guide.",
         guild=test_guild,
     )
     async def help_command(interaction: discord.Interaction):
@@ -581,9 +643,8 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         embed.add_field(
             name="💰 Pricing",
             value=(
-                "`/price`\n"
-                "Get recent sales for a player card.\n"
-                "Optional filters: set, subset, card count."
+                "`🔍 Price Search`\n"
+                "Search recent card sales. You can leave the player blank, then filter by set, subset, and card count."
             ),
             inline=False,
         )
@@ -591,11 +652,11 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         embed.add_field(
             name="🔔 Notifications",
             value=(
-                "`/notify`\n"
-                "Create alerts for player listings.\n"
+                "`🔔 Notify Me`\n"
+                "Create alerts for matching card listings.\n"
                 "You'll be notified when matching cards are listed.\n"
-                "`/remove_notify`\n"
-                "Remove one of your active notification alerts."
+                "`🔕 Remove Notify`\n"
+                "Remove one of your active alerts."
             ),
             inline=False,
         )
@@ -603,11 +664,11 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         embed.add_field(
             name="📝 Listings",
             value=(
-                "`/list_a_player`\n"
+                "`🏷️ List Player`\n"
                 "Create a fixed-price card listing with image upload.\n"
-                "`/auction_a_player`\n"
+                "`🔨 Auction Player`\n"
                 "Create a timed auction with image upload.\n"
-                "`/marketplace`\n"
+                "`🛒 Marketplace`\n"
                 "Browse active marketplace listings in one carousel.\n"
                 "Marketplace items support:\n"
                 "• Claiming\n"
@@ -621,7 +682,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         embed.add_field(
             name="📊 Status",
             value=(
-                "`/status`\n"
+                "`📊 Status`\n"
                 "View your active listings, offers, auction bids, claims, and notifications.\n"
                 "This response is private/ephemeral."
             ),
@@ -631,7 +692,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         embed.add_field(
             name="💬 Feedback",
             value=(
-                "`/feedback`\n"
+                "`💬 Feedback`\n"
                 "Report missing sets, subsets, players, bugs, or general feedback."
             ),
             inline=False,
@@ -840,7 +901,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.select)
 
                 self.confirm_button = ui.Button(
-                    label="Confirm Remove",
+                    label="🗑️ Confirm Remove",
                     style=discord.ButtonStyle.danger,
                     row=1,
                     disabled=True,
@@ -849,7 +910,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.confirm_button)
 
                 self.cancel_button = ui.Button(
-                    label="Cancel",
+                    label="✖️ Cancel",
                     style=discord.ButtonStyle.secondary,
                     row=1,
                 )
@@ -1119,7 +1180,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.card_count_select)
 
                 self.submit_button = ui.Button(
-                    label="Record Transaction",
+                    label="🧾 Record Transaction",
                     style=discord.ButtonStyle.green,
                     row=4,
                 )
@@ -1250,7 +1311,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.card_count_select)
 
                 self.submit_button = ui.Button(
-                    label="Show Prices",
+                    label="💰 Show Prices",
                     style=discord.ButtonStyle.green,
                     row=4,
                 )
@@ -1306,18 +1367,32 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     await interaction.response.send_message("No pricing data found for those filters.", ephemeral=True)
                     return
 
+                async def save_price_search_as_notification(save_interaction: discord.Interaction):
+                    await _save_notify_rule_from_filters(
+                        bot,
+                        db,
+                        save_interaction,
+                        {
+                            "user_id": save_interaction.user.id,
+                            "player_name": player,
+                            "set_name": set_name,
+                            "subset": subset,
+                            "card_count": cc,
+                        },
+                        event_type="price_search_notification_created",
+                    )
+
                 result_view = SharedPriceResultsView(
                     results,
                     interaction.user.id,
                     f"Recent sales for **{player_display}**",
+                    save_callback=save_price_search_as_notification,
                 )
-                paginated_view = result_view if len(results) > result_view.page_size else None
                 edit_kwargs = {
                     "content": result_view.content(),
                     "embeds": result_view.embeds(),
+                    "view": result_view,
                 }
-                if paginated_view is not None:
-                    edit_kwargs["view"] = paginated_view
                 await interaction.response.edit_message(**edit_kwargs)
 
         await interaction.response.send_message(
@@ -1419,7 +1494,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.owner_id = owner_id
 
                 button = ui.Button(
-                    label="Price Assist",
+                    label="💡 Price Assist",
                     style=discord.ButtonStyle.secondary,
                 )
                 button.callback = self.on_view_prices
@@ -1610,7 +1685,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 add_search_buttons(self, row=4)
 
                 self.price_button = ui.Button(
-                    label="Set Price",
+                    label="💵 Set Price",
                     style=discord.ButtonStyle.blurple,
                     row=4,
                 )
@@ -1618,7 +1693,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.price_button)
 
                 self.player_button = ui.Button(
-                    label="Edit Player",
+                    label="✏️ Edit Player",
                     style=discord.ButtonStyle.blurple,
                     row=4,
                 )
@@ -1626,7 +1701,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.player_button)
 
                 self.submit_button = ui.Button(
-                    label="Create Listing",
+                    label="🏷️ Create Listing",
                     style=discord.ButtonStyle.green,
                     row=4,
                 )
@@ -1854,24 +1929,20 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
             await interaction.response.send_message("Bid increment must be greater than 0.", ephemeral=True)
             return
 
-        sale_channel = bot.get_channel(bot.sale_channel_id)
-        if sale_channel is None:
-            try:
-                sale_channel = await bot.fetch_channel(bot.sale_channel_id)
-            except Exception as exc:
-                LOGGER.error("Could not fetch sale channel: %s", exc)
-                log_marketplace_event(
-                    db,
-                    "auction_create_failed",
-                    user_id=interaction.user.id,
-                    details=f"Could not fetch sale channel: {exc}",
-                    level=40,
-                )
-                await interaction.response.send_message(
-                    "Sale channel is not configured or could not be found. Please contact an admin.",
-                    ephemeral=True,
-                )
-                return
+        auction_channel = await bot.fetch_channel_safely(bot.auction_surface_channel_id)
+        if auction_channel is None:
+            log_marketplace_event(
+                db,
+                "auction_create_failed",
+                user_id=interaction.user.id,
+                details="Auction channel is not configured or could not be found.",
+                level=40,
+            )
+            await interaction.response.send_message(
+                "Auction channel is not configured or could not be found. Please contact an admin.",
+                ephemeral=True,
+            )
+            return
 
         class AuctionPaymentMethodsModal(ui.Modal, title="Payment Platforms"):
             def __init__(self, parent_view, listing_data: dict):
@@ -1898,11 +1969,11 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 await self.parent_view.create_auction(interaction, self.listing_data)
 
         class AuctionPlayerView(ui.View):
-            def __init__(self, bot, db, sale_channel, player_name, starting_price, duration_hours, bid_increment):
+            def __init__(self, bot, db, auction_channel, player_name, starting_price, duration_hours, bid_increment):
                 super().__init__(timeout=300)
                 self.bot = bot
                 self.db = db
-                self.sale_channel = sale_channel
+                self.auction_channel = auction_channel
                 self.player_name = player_name
                 self.starting_price = starting_price
                 self.duration_hours = duration_hours
@@ -1957,7 +2028,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.card_count_select)
 
                 self.submit_button = ui.Button(
-                    label="Submit Auction",
+                    label="🔨 Submit Auction",
                     style=discord.ButtonStyle.green,
                     row=4,
                 )
@@ -2002,7 +2073,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 await publish_listing(
                     self.bot,
                     self.db,
-                    self.sale_channel,
+                    self.auction_channel,
                     interaction,
                     listing_data,
                     image_file=image_file,
@@ -2051,7 +2122,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         view = AuctionPlayerView(
             bot,
             db,
-            sale_channel,
+            auction_channel,
             player_name,
             starting_price,
             duration_hours,
@@ -2131,7 +2202,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.add_item(self.card_count_select)
 
                 self.submit_button = ui.Button(
-                    label="Create Notification",
+                    label="🔔 Create Notification",
                     style=discord.ButtonStyle.green,
                     row=4,
                 )
@@ -2184,31 +2255,14 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     "card_count": self.card_count_value,
                 }
 
-                rule["id"] = db.add_notify_rule(rule)
-                bot.notify_rules.append(rule)
-                log_marketplace_event(
+                await _save_notify_rule_from_filters(
+                    bot,
                     db,
-                    "notification_created",
-                    user_id=interaction.user.id,
-                    details={
-                        "player": player_name or None,
-                        "set_name": self.set_value,
-                        "subset": self.subset_value,
-                        "card_count": self.card_count_value,
-                    },
-                    level=20,
+                    interaction,
+                    rule,
+                    event_type="notification_created",
+                    edit_response=True,
                 )
-
-                await interaction.response.edit_message(
-                    content=(
-                        f"? Notification created for **{player_name or 'Any Player'}**.\n\n"
-                        f"Set: `{self.set_value or 'Any Set'}`\n"
-                        f"Subset: `{self.subset_value or 'Any Subset'}`\n"
-                        f"Card Count: /{self.card_count_value or 'Any'}"
-                    ),
-                    view=None,
-                )
-
                 self.stop()
 
         await interaction.response.send_message(
@@ -2216,3 +2270,153 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
             view=NotifyView(),
             ephemeral=True,
         )
+
+    async def _invoke_command(command, interaction: discord.Interaction, *args, **kwargs):
+        callback = getattr(command, "callback", command)
+        return await callback(interaction, *args, **kwargs)
+
+    class OptionalPlayerModal(ui.Modal):
+        def __init__(self, title: str, callback):
+            super().__init__(title=title)
+            self.callback_fn = callback
+            self.player_name = ui.TextInput(
+                label="Player name",
+                placeholder="Leave blank for any player",
+                required=False,
+                max_length=120,
+            )
+            self.add_item(self.player_name)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            player_name = normalize_player_name(self.player_name.value)
+            await self.callback_fn(interaction, player_name or None)
+
+    class AuctionStartModal(ui.Modal, title="Create Auction"):
+        def __init__(self):
+            super().__init__()
+            self.player_name = ui.TextInput(
+                label="Player name(s)",
+                placeholder="Luka Doncic",
+                required=True,
+                max_length=120,
+            )
+            self.starting_price = ui.TextInput(
+                label="Starting price",
+                placeholder="25.00",
+                required=True,
+                max_length=20,
+            )
+            self.duration_hours = ui.TextInput(
+                label="Duration hours",
+                placeholder="24",
+                default="24",
+                required=True,
+                max_length=3,
+            )
+            self.bid_increment = ui.TextInput(
+                label="Bid increment",
+                placeholder="1.00",
+                default="1.00",
+                required=True,
+                max_length=20,
+            )
+            self.add_item(self.player_name)
+            self.add_item(self.starting_price)
+            self.add_item(self.duration_hours)
+            self.add_item(self.bid_increment)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            player_name = normalize_player_name(self.player_name.value)
+            try:
+                starting_price = float(str(self.starting_price.value).replace("$", "").replace(",", "").strip())
+                duration_hours = int(str(self.duration_hours.value).strip())
+                bid_increment = float(str(self.bid_increment.value).replace("$", "").replace(",", "").strip())
+            except (TypeError, ValueError):
+                await interaction.response.send_message(
+                    "Starting price, duration, and bid increment must be valid numbers.",
+                    ephemeral=True,
+                )
+                return
+
+            await _invoke_command(
+                auction_a_player,
+                interaction,
+                player_name,
+                starting_price,
+                duration_hours,
+                bid_increment,
+            )
+
+    class BotInterfaceView(ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @ui.button(label="🏷️ List Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=0)
+        async def list_player_button(self, interaction: discord.Interaction, button: ui.Button):
+            await _invoke_command(list_a_player, interaction)
+
+        @ui.button(label="🔨 Auction Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=0)
+        async def auction_player_button(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.send_modal(AuctionStartModal())
+
+        @ui.button(label="🔔 Notify Me", style=discord.ButtonStyle.green, custom_id="nba_bot:notify", row=2)
+        async def notify_button(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.send_modal(
+                OptionalPlayerModal(
+                    "Create Notification",
+                    lambda modal_interaction, player_name: _invoke_command(notify, modal_interaction, player_name),
+                )
+            )
+
+        @ui.button(label="🔕 Remove Notify", style=discord.ButtonStyle.red, custom_id="nba_bot:remove_notify", row=2)
+        async def remove_notify_button(self, interaction: discord.Interaction, button: ui.Button):
+            await _invoke_command(remove_notify, interaction)
+
+        @ui.button(label="🔍 Price Search", style=discord.ButtonStyle.blurple, custom_id="nba_bot:price", row=1)
+        async def price_button(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.send_modal(
+                OptionalPlayerModal(
+                    "Price Search",
+                    lambda modal_interaction, player_name: _invoke_command(price, modal_interaction, player_name),
+                )
+            )
+
+        @ui.button(label="📊 Status", style=discord.ButtonStyle.blurple, custom_id="nba_bot:status", row=3)
+        async def status_button(self, interaction: discord.Interaction, button: ui.Button):
+            await _invoke_command(status, interaction)
+
+        @ui.button(label="❓ Help", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=4)
+        async def help_button(self, interaction: discord.Interaction, button: ui.Button):
+            await _invoke_command(help_command, interaction)
+
+        @ui.button(label="💬 Feedback", style=discord.ButtonStyle.secondary, custom_id="nba_bot:feedback", row=4)
+        async def feedback_button(self, interaction: discord.Interaction, button: ui.Button):
+            await _invoke_command(feedback, interaction)
+
+        @ui.button(label="🛒 Marketplace", style=discord.ButtonStyle.blurple, custom_id="nba_bot:open_marketplace", row=1)
+        async def open_marketplace_button(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            listings = _get_active_marketplace_listings(bot)
+            log_marketplace_event(
+                db,
+                "marketplace_view_opened",
+                user_id=interaction.user.id,
+                details={
+                    "active_listing_count": len(listings),
+                    "source": "nba_bot_interface",
+                },
+            )
+            view = MarketplaceCarouselView(
+                bot,
+                db,
+                listings,
+                owner_id=interaction.user.id,
+            )
+            kwargs = await view.build_message_kwargs()
+            await interaction.followup.send(
+                **kwargs,
+                view=view,
+                ephemeral=True,
+            )
+
+    bot.bot_interface_view_factory = BotInterfaceView

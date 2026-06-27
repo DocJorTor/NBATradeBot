@@ -216,6 +216,26 @@ class CardDatabase:
             return
         self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
+    def get_metadata(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return default
+        return row["value"]
+
+    def set_metadata(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO metadata (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        self.conn.commit()
+
     @staticmethod
     def _coerce_card_count(value: Any) -> Any:
         if value in (None, ""):
