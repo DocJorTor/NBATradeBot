@@ -5,7 +5,7 @@ import asyncio
 import time
 
 from datetime import datetime, timedelta, timezone
-from discord import ui, app_commands
+from discord import ui
 
 from actions import collect_listing_image, publish_listing
 from typing import Optional, TYPE_CHECKING
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from bot import NBACollectBot
 
 from components import (
+    PlayerNamePromptModal,
     add_search_buttons,
     build_card_count_options,
     build_set_options,
@@ -24,6 +25,7 @@ from components import (
     on_subset_select,
     on_variant_select,
 )
+from config import format_subset_for_set, has_subset_variants
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
 from ocr import extract_listing_metadata
@@ -37,6 +39,7 @@ from serializers import build_listing_embed, format_card_count
 from sheets import PriceSheet
 from views import ClaimedListingView, ListingActionView, MarketplaceCarouselView
 ANY_VALUE = "ANY"
+BUTTON_PAD = "\u00a0"
 
 
 def _extract_listing_metadata_for_review(image_bytes: bytes | None, known_players: list[str]):
@@ -54,6 +57,10 @@ def _format_price(value) -> str:
         return f"${float(value):.2f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _filter_or_none(value):
+    return None if value in (None, "", ANY_VALUE) else value
 
 
 def _get_active_listings_for_user(bot: "NBACollectBot", user_id: int) -> list[dict]:
@@ -624,86 +631,35 @@ class StatusActionsView(ui.View):
             ephemeral=True,
         )
 
-def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase) -> None:
-    test_guild = discord.Object(id=int(bot.config["discord_guild_id"]))
-
-    @bot.tree.command(
-        name="help",
-        description="View the NBA Trade Bot button guide.",
-        guild=test_guild,
-    )
+def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase) -> None:
     async def help_command(interaction: discord.Interaction):
 
         embed = discord.Embed(
             title="🏀 NBA Trade Bot Help",
-            description="Marketplace and pricing tools for NBA digital card trading.",
-            color=discord.Color.orange(),
-        )
-
-        embed.add_field(
-            name="💰 Pricing",
-            value=(
+            description=(
+                "Marketplace and pricing tools for NBA digital card trading.\n\n"
                 "`🔍 Price Search`\n"
-                "Search recent card sales. You can leave the player blank, then filter by set, subset, and card count."
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="🔔 Notifications",
-            value=(
+                "Search recent card sales. You can leave the player blank, then filter by set, subset, and card count.\n\n"
                 "`🔔 Notifications`\n"
-                "View your active alerts, then use `🔔 Add Notification` or `🔕 Remove Notification`."
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="📝 Listings",
-            value=(
+                "View your active alerts, then use `🔔 Add Notification` or `🔕 Remove Notification`.\n\n"
                 "`🏷️ List Player`\n"
-                "Create a fixed-price card listing with image upload.\n"
+                "Create a fixed-price card listing with image upload.\n\n"
                 "`🔨 Auction Player`\n"
-                "Create a timed auction with image upload.\n"
+                "Create a timed auction with image upload.\n\n"
                 "`🛒 Marketplace`\n"
-                "Browse active marketplace listings in one carousel.\n"
-                "Marketplace items support:\n"
-                "• Claiming\n"
-                "• Offers on listings and bidding on auctions\n"
-                "• Auctions\n"
-                "• Transaction reporting"
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="📊 Status",
-            value=(
-                "`📊 Status`\n"
-                "View your active listings, offers, auction bids, claims, and notifications.\n"
-                "This response is private/ephemeral."
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="💬 Feedback",
-            value=(
-                "`💬 Feedback`\n"
+                "Browse active marketplace listings in one carousel. Claim listings, make offers, bid on auctions, and record transactions.\n\n"
+                "`📊 View Status`\n"
+                "View your active listings, offers, auction bids, claims, and notifications. This response is private.\n\n"
+                "`💬 Leave Feedback`\n"
                 "Report missing sets, subsets, players, bugs, or general feedback."
             ),
-            inline=False,
+            color=discord.Color.orange(),
         )
 
         embed.set_footer(text="Built to help!")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @bot.tree.command(
-        name="feedback",
-        description="Report missing data, bugs, or general feedback.",
-        guild=test_guild,
-    )
     async def feedback(interaction: discord.Interaction):
         categories = {
             "missing_set": {
@@ -825,38 +781,6 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
             ephemeral=True,
         )
 
-    @bot.tree.command(
-        name="marketplace",
-        description="Browse active listings and auctions in a carousel.",
-        guild=test_guild,
-    )
-    async def marketplace(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        listings = _get_active_marketplace_listings(bot)
-        log_marketplace_event(
-            db,
-            "marketplace_view_opened",
-            user_id=interaction.user.id,
-            details={"active_listing_count": len(listings)},
-        )
-        view = MarketplaceCarouselView(
-            bot,
-            db,
-            listings,
-            owner_id=interaction.user.id,
-        )
-        kwargs = await view.build_message_kwargs()
-        await interaction.followup.send(
-            **kwargs,
-            view=view,
-            ephemeral=True,
-        )
-
-    @bot.tree.command(
-        name="remove_notify",
-        description="Remove one of your active notification alerts.",
-        guild=test_guild,
-    )
     async def remove_notify(interaction: discord.Interaction):
         user_id = interaction.user.id
         notify_rules = [
@@ -1013,11 +937,6 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
             ephemeral=True,
         )
 
-    @bot.tree.command(
-        name="status",
-        description="View your active listings, offers, auction bids, claims, and notifications.",
-        guild=test_guild,
-    )
     async def status(interaction: discord.Interaction):
         user_id = interaction.user.id
 
@@ -1086,220 +1005,67 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         else:
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @bot.tree.command(
-        name="record_transaction",
-        description="Record a completed transaction without a linked Discord listing.",
-        guild=test_guild,
-    )
-    @app_commands.describe(
-        player_name="Player name(s) for the card(s)",
-        price="Final sale price",
-    )
-    async def record_transaction(
-        interaction: discord.Interaction,
-        player_name: str,
-        price: float,
-    ):
-        configured_channel_id = bot.config.get("record_transaction_channel_id")
-        if configured_channel_id and interaction.channel_id != int(configured_channel_id):
-            await interaction.response.send_message(
-                "Please use this command in the configured transaction channel.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            player_name = normalize_player_name(player_name)
-            if not player_name:
-                raise ValueError("Player name is required.")
-            if price <= 0:
-                raise ValueError("Price must be greater than 0.")
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-
-        class RecordTransactionView(ui.View):
-            def __init__(self):
-                super().__init__(timeout=300)
-                self.set_optional = False
-                self.subset_required = True
+    async def price(interaction: discord.Interaction, player: Optional[str] = None):
+        class PriceSelectView(ui.View):
+            def __init__(self, initial_player: str | None = None):
+                super().__init__(timeout=180)
+                self.set_optional = True
+                self.subset_required = False
+                self.include_any_options = False
+                self.player_name = normalize_player_name(initial_player)
                 self.set_value = None
                 self.subset_group_value = None
                 self.subset_variant_value = None
                 self.subset_value = None
                 self.card_count_value = None
+                self.sync_filter_items()
+
+            def _variant_required(self) -> bool:
+                return bool(
+                    self.set_value
+                    and self.subset_group_value
+                    and has_subset_variants(self.set_value, self.subset_group_value)
+                )
+
+            def sync_filter_items(self) -> None:
+                self.clear_items()
 
                 self.set_select = ui.Select(
-                    placeholder="Select Card Set",
+                    placeholder="Select Set",
                     options=build_set_options(self),
                     row=0,
                 )
-
                 async def handle_set_select(interaction: discord.Interaction):
-                    await on_set_select(self, interaction, True)
+                    await self.on_set_select(interaction)
 
                 self.set_select.callback = handle_set_select
                 self.add_item(self.set_select)
 
                 self.subset_select = ui.Select(
                     placeholder="Select Subset",
-                    options=[
-                        discord.SelectOption(
-                            label="Select a set first",
-                            value="select_set_first",
-                        )
-                    ],
-                    disabled=True,
+                    options=build_subset_options(self),
+                    disabled=not self.set_value,
                     row=1,
                 )
                 self.subset_select.callback = self.on_subset_select
                 self.add_item(self.subset_select)
 
-                self.variant_select = ui.Select(
-                    placeholder="Select Variant",
-                    options=build_variant_options(self),
-                    disabled=True,
-                    row=2,
-                )
-                self.variant_select.callback = self.on_variant_select
-                self.add_item(self.variant_select)
-
+                if self._variant_required():
+                    self.variant_select = ui.Select(
+                        placeholder="Select Variant",
+                        options=build_variant_options(self),
+                        row=2,
+                    )
+                    self.variant_select.callback = self.on_variant_select
+                    self.add_item(self.variant_select)
+                card_count_row = 3 if self._variant_required() else 2
                 self.card_count_select = ui.Select(
                     placeholder="Select Card Count",
-                    options=build_card_count_options(selected_value=ANY_VALUE),
-                    row=3,
-                )
-
-                async def handle_card_count_select(interaction: discord.Interaction):
-                    await on_card_count_select(self, interaction)
-
-                self.card_count_select.callback = handle_card_count_select
-                self.add_item(self.card_count_select)
-
-                self.submit_button = ui.Button(
-                    label="🧾 Record Transaction",
-                    style=discord.ButtonStyle.green,
-                    row=4,
-                )
-                self.submit_button.callback = self.on_submit
-                self.add_item(self.submit_button)
-                add_search_buttons(self)
-
-            async def on_subset_select(self, interaction: discord.Interaction):
-                await on_subset_select(self, interaction)
-
-            async def on_variant_select(self, interaction: discord.Interaction):
-                await on_variant_select(self, interaction)
-
-            async def on_submit(self, interaction: discord.Interaction):
-                if not self.set_value or not self.subset_value or not self.card_count_value:
-                    await interaction.response.send_message(
-                        "Please select set, subset, and card count.",
-                        ephemeral=True,
-                    )
-                    return
-
-                await interaction.response.defer(ephemeral=True, thinking=True)
-
-                set_name = self.set_value.replace("_", " ").title()
-                subset = self.subset_value
-                card_count_value = self.card_count_value
-                record_date = format_sheet_datetime()
-                if sheet is not None:
-                    sheet.add_sale(
-                        player_names=player_name,
-                        set_name=set_name,
-                        subset=subset,
-                        date_time=record_date,
-                        price=price,
-                        card_count=card_count_value,
-                    )
-                else:
-                    db.add_sale(
-                        player_names=player_name,
-                        set_name=set_name,
-                        subset=subset,
-                        date_time=record_date,
-                        price=price,
-                        card_count=card_count_value,
-                    )
-
-                log_marketplace_event(
-                    db,
-                    "manual_transaction_recorded",
-                    user_id=interaction.user.id,
-                    details={
-                        "player_names": player_name,
-                        "set_name": set_name,
-                        "subset": subset,
-                        "card_count": card_count_value,
-                        "price": price,
-                    },
-                )
-                await interaction.followup.send(
-                    f"Transaction recorded for **{player_name}** at ${price:.2f}.",
-                    ephemeral=True,
-                )
-                self.stop()
-
-        view = RecordTransactionView()
-        await interaction.response.send_message(
-            f"Select set, subset, and card count for **{player_name}** at ${price:.2f}:",
-            view=view,
-            ephemeral=True,
-        )
-
-
-    @bot.tree.command(name="price", description="Get the latest price estimate for a player card.", guild=test_guild)
-    @app_commands.describe(player="Optional player name to query")
-    async def price(interaction: discord.Interaction, player: Optional[str] = None):
-        player = normalize_player_name(player)
-        player_display = player or "Any Player"
-
-        class PriceSelectView(ui.View):
-            def __init__(self):
-                super().__init__(timeout=120)
-                self.set_optional = True
-                self.subset_required = False
-                self.set_value = None
-                self.subset_group_value = None
-                self.subset_variant_value = None
-                self.subset_value = None
-                self.card_count_value = None
-
-                self.set_select = ui.Select(
-                    placeholder="Select Card Set (optional)",
-                        options=build_set_options(self),
-                        row=0,
-                    )
-                async def handle_set_select(interaction: discord.Interaction):
-                    await on_set_select(self, interaction, False)
-
-                self.set_select.callback = handle_set_select
-                self.add_item(self.set_select)
-
-                self.subset_select = ui.Select(
-                    placeholder="Select Subset (optional)",
-                    options=[discord.SelectOption(label="Any", value=ANY_VALUE)],
-                    disabled=True,
-                    row=1,
-                )
-                self.subset_select.callback = self.on_subset_select
-                self.add_item(self.subset_select)
-
-                self.variant_select = ui.Select(
-                    placeholder="Select Variant",
-                    options=build_variant_options(self),
-                    disabled=True,
-                    row=2,
-                )
-                self.variant_select.callback = self.on_variant_select
-                self.add_item(self.variant_select)
-
-                self.card_count_select = ui.Select(
-                    placeholder="Select Card Count",
-                    options=build_card_count_options(selected_value=ANY_VALUE),
-                    row=3,
+                    options=build_card_count_options(
+                        selected_value=self.card_count_value,
+                        include_any=self.include_any_options,
+                    ),
+                    row=card_count_row,
                 )
                 async def handle_card_count_select(interaction: discord.Interaction):
                     await on_card_count_select(self, interaction)
@@ -1314,23 +1080,123 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 )
                 self.submit_button.callback = self.on_submit
                 self.add_item(self.submit_button)
-                add_search_buttons(self)
+                self.player_button = ui.Button(
+                    label="🔍 Select Player",
+                    style=discord.ButtonStyle.blurple,
+                    row=4,
+                )
+                self.player_button.callback = self.on_player_name
+                self.add_item(self.player_button)
+                add_search_buttons(self, row=4)
+                self.clear_button = ui.Button(
+                    label="Clear Filters",
+                    style=discord.ButtonStyle.red,
+                    row=4,
+                )
+                self.clear_button.callback = self.on_clear_filters
+                self.add_item(self.clear_button)
 
+            def selected_summary(self) -> str:
+                player_display = self.player_name or "Any Player"
+                set_display = self.set_value or "Any Set"
+                if self.subset_value:
+                    subset_display = self.subset_value
+                elif self.subset_group_value and self._variant_required():
+                    subset_display = f"{self.subset_group_value} (choose variant)"
+                else:
+                    subset_display = self.subset_group_value or "Any Subset"
+                if self.card_count_value is None:
+                    card_count_display = "Any Card Count"
+                elif str(self.card_count_value) in {"999", "9999"}:
+                    card_count_display = "Unlimited"
+                else:
+                    card_count_display = str(self.card_count_value)
+                return (
+                    "Select search filters, then choose **Show Prices**.\n\n"
+                    f"Player: `{player_display}`\n"
+                    f"Set: `{set_display}`\n"
+                    f"Subset: `{subset_display}`\n"
+                    f"Card Count: `{card_count_display}`"
+                )
+
+            async def on_player_name(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(
+                    PlayerNamePromptModal(
+                        "Search Player",
+                        self.on_player_name_submit,
+                        normalizer=normalize_player_name,
+                        initial_value=self.player_name,
+                    )
+                )
+
+            async def on_player_name_submit(self, interaction: discord.Interaction, player_name: str | None):
+                self.player_name = player_name
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
+            async def on_clear_filters(self, interaction: discord.Interaction):
+                self.player_name = None
+                self.set_value = None
+                self.subset_group_value = None
+                self.subset_variant_value = None
+                self.subset_value = None
+                self.card_count_value = None
+                self.set_option_order = None
+                self.subset_option_order = None
+                self.variant_option_order = None
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
+            async def on_set_select(self, interaction: discord.Interaction):
+                selected = self.set_select.values[0]
+                self.set_value = None if selected == ANY_VALUE else selected
+                self.subset_group_value = None
+                self.subset_variant_value = None
+                self.subset_value = None
+                self.subset_option_order = None
+                self.variant_option_order = None
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_subset_select(self, interaction: discord.Interaction):
-                await on_subset_select(self, interaction)
+                selected = self.subset_select.values[0]
+                if selected == ANY_VALUE:
+                    self.subset_group_value = None
+                    self.subset_variant_value = None
+                    self.subset_value = None
+                else:
+                    self.subset_group_value = selected
+                    self.subset_variant_value = None
+                    if self._variant_required():
+                        self.subset_value = None
+                    else:
+                        self.subset_value = selected
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_variant_select(self, interaction: discord.Interaction):
-                await on_variant_select(self, interaction)
+                selected = self.variant_select.values[0]
+                if selected in {"select_subset_first", "no_variants"}:
+                    await interaction.response.edit_message(content=self.selected_summary(), view=self)
+                    return
+                self.subset_variant_value = selected
+                self.subset_value = format_subset_for_set(
+                    self.set_value,
+                    self.subset_group_value,
+                    self.subset_variant_value,
+                )
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_submit(self, interaction: discord.Interaction):
-                set_name = self.set_value if self.set_value and self.set_value != ANY_VALUE else None
-                subset = self.subset_value if self.subset_value else None
-                cc = self.card_count_value
-                # Query with all filters
+                set_name = _filter_or_none(self.set_value)
+                subset = _filter_or_none(self.subset_value)
+                cc = _filter_or_none(self.card_count_value)
+                player_name = _filter_or_none(self.player_name)
+                player_display = player_name or "Any Player"
                 results = query_price_source(
                     sheet or db,
-                    player_name=player or None,
+                    player_name=player_name,
                     set_name=set_name,
                     cc=cc,
                     subset=subset,
@@ -1340,7 +1206,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     "price_search",
                     user_id=interaction.user.id,
                     details={
-                        "player": player,
+                        "player": player_name,
                         "set_name": set_name,
                         "subset": subset,
                         "card_count": cc,
@@ -1354,7 +1220,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                         "price_search_empty",
                         user_id=interaction.user.id,
                         details={
-                            "player": player,
+                            "player": player_name,
                             "set_name": set_name,
                             "subset": subset,
                             "card_count": cc,
@@ -1371,7 +1237,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                         save_interaction,
                         {
                             "user_id": save_interaction.user.id,
-                            "player_name": player,
+                            "player_name": player_name,
                             "set_name": set_name,
                             "subset": subset,
                             "card_count": cc,
@@ -1385,21 +1251,21 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     f"Recent sales for **{player_display}**",
                     save_callback=save_price_search_as_notification,
                 )
-                edit_kwargs = {
-                    "content": result_view.content(),
-                    "embeds": result_view.embeds(),
-                    "view": result_view,
-                }
-                await interaction.response.edit_message(**edit_kwargs)
+                await interaction.response.send_message(
+                    content=result_view.content(),
+                    embeds=result_view.embeds(),
+                    view=result_view,
+                    ephemeral=True,
+                )
 
+        view = PriceSelectView(player)
         await interaction.response.send_message(
-            f"Select filters for {player_display} (all optional):",
-            view=PriceSelectView(),
+            view.selected_summary(),
+            view=view,
             ephemeral=True,
         )
 
 
-    @bot.tree.command(name="list_a_player", description="List a player card for sale", guild=test_guild)
     async def list_a_player(interaction: discord.Interaction):
         upload_sessions = getattr(bot, "listing_upload_sessions", None)
         if upload_sessions is None:
@@ -1628,7 +1494,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.review_message = None
 
                 self.set_select = ui.Select(
-                    placeholder="Select Card Set",
+                    placeholder="Select Set",
                     options=build_set_options(self),
                     row=0,
                 )
@@ -1843,7 +1709,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 "No image was received.",
             )
             await interaction.followup.send(
-                "No image was received, so the listing was not started. Run `/list_a_player` again when you are ready to upload.",
+                "No image was received, so the listing was not started. Use List Player again when you are ready to upload.",
                 ephemeral=True,
             )
             return
@@ -1901,13 +1767,6 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     ephemeral=True,
                 )
 
-    @bot.tree.command(name="auction_a_player", description="Create an auction for a player card", guild=test_guild)
-    @app_commands.describe(
-        player_name="Player name(s) for the card(s)",
-        starting_price="Minimum opening bid",
-        duration_hours="Auction duration in hours",
-        bid_increment="Minimum amount each new bid must beat the current high bid by",
-    )
     async def auction_a_player(
         interaction: discord.Interaction,
         player_name: str = None,
@@ -2117,7 +1976,7 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 self.review_message = None
 
                 self.set_select = ui.Select(
-                    placeholder="Select Card Set",
+                    placeholder="Select Set",
                     options=build_set_options(self),
                     row=0,
                 )
@@ -2404,17 +2263,15 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 )
 
 
-    @bot.tree.command(name="notify", description="Get DMed when a matching card is listed", guild=test_guild)
-    @app_commands.describe(player_name="Optional player name to watch for")
     async def notify(interaction: discord.Interaction, player_name: str = None):
-        player_name = normalize_player_name(player_name)
-
         class NotifyView(ui.View):
-            def __init__(self):
+            def __init__(self, initial_player: str | None = None):
                 super().__init__(timeout=300)
 
                 self.set_optional = True
                 self.subset_required = False
+                self.include_any_options = False
+                self.player_name = normalize_player_name(initial_player)
                 self.set_value = None
                 self.subset_group_value = None
                 self.subset_variant_value = None
@@ -2425,40 +2282,54 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 # IMPORTANT: You should still initialize bot.notify_rules = [] before bot.run(...).
                 if not hasattr(bot, "notify_rules"):
                     bot.notify_rules = []
+                self.sync_filter_items()
+
+            def _variant_required(self) -> bool:
+                return bool(
+                    self.set_value
+                    and self.subset_group_value
+                    and has_subset_variants(self.set_value, self.subset_group_value)
+                )
+
+            def sync_filter_items(self) -> None:
+                self.clear_items()
 
                 self.set_select = ui.Select(
-                    placeholder="Optional: Select Card Set",
+                    placeholder="Select Set",
                     options=build_set_options(self),
                     row=0,
                 )
                 async def handle_set_select(interaction: discord.Interaction):
-                    await on_set_select(self, interaction, False)
+                    await self.on_set_select(interaction)
 
                 self.set_select.callback = handle_set_select
                 self.add_item(self.set_select)
 
                 self.subset_select = ui.Select(
-                    placeholder="Optional: Select Subset",
+                    placeholder="Select Subset",
                     options=build_subset_options(self),
-                    disabled=True,
+                    disabled=not self.set_value,
                     row=1,
                 )
                 self.subset_select.callback = self.on_subset_select
                 self.add_item(self.subset_select)
 
-                self.variant_select = ui.Select(
-                    placeholder="Optional: Select Variant",
-                    options=build_variant_options(self),
-                    disabled=True,
-                    row=2,
-                )
-                self.variant_select.callback = self.on_variant_select
-                self.add_item(self.variant_select)
-
+                if self._variant_required():
+                    self.variant_select = ui.Select(
+                        placeholder="Optional: Select Variant",
+                        options=build_variant_options(self),
+                        row=2,
+                    )
+                    self.variant_select.callback = self.on_variant_select
+                    self.add_item(self.variant_select)
+                card_count_row = 3 if self._variant_required() else 2
                 self.card_count_select = ui.Select(
-                    placeholder="Optional: Select Card Count",
-                    options=build_card_count_options(selected_value=ANY_VALUE),
-                    row=3,
+                    placeholder="Select Card Count",
+                    options=build_card_count_options(
+                        selected_value=self.card_count_value,
+                        include_any=self.include_any_options,
+                    ),
+                    row=card_count_row,
                 )
                 async def handle_card_count_select(interaction: discord.Interaction):
                     await on_card_count_select(self, interaction)
@@ -2473,12 +2344,31 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 )
                 self.submit_button.callback = self.on_submit
                 self.add_item(self.submit_button)
-                add_search_buttons(self)
+                self.player_button = ui.Button(
+                    label="🔍 Select Player",
+                    style=discord.ButtonStyle.blurple,
+                    row=4,
+                )
+                self.player_button.callback = self.on_player_name
+                self.add_item(self.player_button)
+                add_search_buttons(self, row=4)
+                self.clear_button = ui.Button(
+                    label="Clear Filters",
+                    style=discord.ButtonStyle.red,
+                    row=4,
+                )
+                self.clear_button.callback = self.on_clear_filters
+                self.add_item(self.clear_button)
 
             def selected_summary(self) -> str:
-                player_display = player_name or "Any Player"
+                player_display = self.player_name or "Any Player"
                 set_display = self.set_value or "Any Set"
-                subset_display = self.subset_value or "Any Subset"
+                if self.subset_value:
+                    subset_display = self.subset_value
+                elif self.subset_group_value and self._variant_required():
+                    subset_display = f"{self.subset_group_value} (choose variant)"
+                else:
+                    subset_display = self.subset_group_value or "Any Subset"
 
                 if self.card_count_value is None:
                     card_count_display = "Any Card Count"
@@ -2488,23 +2378,84 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                     card_count_display = str(self.card_count_value)
 
                 return (
-                    f"Create a notification for **{player_display}**.\n\n"
-                    f"**Selected filters:**\n"
+                    "Choose notification filters, then select **🔔 Create Notification**.\n\n"
                     f"Player: `{player_display}`\n"
                     f"Set: `{set_display}`\n"
                     f"Subset: `{subset_display}`\n"
                     f"Card Count: `{card_count_display}`"
                 )
 
+            async def on_player_name(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(
+                    PlayerNamePromptModal(
+                        "Search Player",
+                        self.on_player_name_submit,
+                        normalizer=normalize_player_name,
+                        initial_value=self.player_name,
+                    )
+                )
+
+            async def on_player_name_submit(self, interaction: discord.Interaction, player_name: str | None):
+                self.player_name = player_name
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
+            async def on_clear_filters(self, interaction: discord.Interaction):
+                self.player_name = None
+                self.set_value = None
+                self.subset_group_value = None
+                self.subset_variant_value = None
+                self.subset_value = None
+                self.card_count_value = None
+                self.set_option_order = None
+                self.subset_option_order = None
+                self.variant_option_order = None
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
+            async def on_set_select(self, interaction: discord.Interaction):
+                selected = self.set_select.values[0]
+                self.set_value = None if selected == ANY_VALUE else selected
+                self.subset_group_value = None
+                self.subset_variant_value = None
+                self.subset_value = None
+                self.subset_option_order = None
+                self.variant_option_order = None
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
             async def on_subset_select(self, interaction: discord.Interaction):
-                await on_subset_select(self, interaction)
+                selected = self.subset_select.values[0]
+                if selected == ANY_VALUE:
+                    self.subset_group_value = None
+                    self.subset_variant_value = None
+                    self.subset_value = None
+                else:
+                    self.subset_group_value = selected
+                    self.subset_variant_value = None
+                    if self._variant_required():
+                        self.subset_value = None
+                    else:
+                        self.subset_value = selected
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_variant_select(self, interaction: discord.Interaction):
-                await on_variant_select(self, interaction)
-
+                selected = self.variant_select.values[0]
+                if selected in {"select_subset_first", "no_variants"}:
+                    await interaction.response.edit_message(content=self.selected_summary(), view=self)
+                    return
+                self.subset_variant_value = selected
+                self.subset_value = format_subset_for_set(
+                    self.set_value,
+                    self.subset_group_value,
+                    self.subset_variant_value,
+                )
+                self.sync_filter_items()
+                await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_submit(self, interaction: discord.Interaction):
-                if not player_name and not self.set_value and not self.subset_value and self.card_count_value is None:
+                if not self.player_name and not self.set_value and not self.subset_value and self.card_count_value is None:
                     await interaction.response.send_message(
                         "Choose at least one notification filter: player, set, subset, or card count.",
                         ephemeral=True,
@@ -2513,11 +2464,11 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
 
                 rule = {
                     "user_id": interaction.user.id,
-                    "player_name": player_name,
+                    "player_name": _filter_or_none(self.player_name),
                     # Keep this as the exact selected set key/name so matching works later.
-                    "set_name": self.set_value,
-                    "subset": self.subset_value,
-                    "card_count": self.card_count_value,
+                    "set_name": _filter_or_none(self.set_value),
+                    "subset": _filter_or_none(self.subset_value),
+                    "card_count": _filter_or_none(self.card_count_value),
                 }
 
                 await _save_notify_rule_from_filters(
@@ -2530,31 +2481,12 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 )
                 self.stop()
 
+        view = NotifyView(player_name)
         await interaction.response.send_message(
-            f"Create a notification for **{player_name or 'Any Player'}**. Choose at least one filter.",
-            view=NotifyView(),
+            view.selected_summary(),
+            view=view,
             ephemeral=True,
         )
-
-    async def _invoke_command(command, interaction: discord.Interaction, *args, **kwargs):
-        callback = getattr(command, "callback", command)
-        return await callback(interaction, *args, **kwargs)
-
-    class OptionalPlayerModal(ui.Modal):
-        def __init__(self, title: str, callback):
-            super().__init__(title=title)
-            self.callback_fn = callback
-            self.player_name = ui.TextInput(
-                label="Player name",
-                placeholder="Leave blank for any player",
-                required=False,
-                max_length=120,
-            )
-            self.add_item(self.player_name)
-
-        async def on_submit(self, interaction: discord.Interaction):
-            player_name = normalize_player_name(self.player_name.value)
-            await self.callback_fn(interaction, player_name or None)
 
     class NotificationHubView(ui.View):
         def __init__(self, owner_id: int):
@@ -2574,18 +2506,13 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
         async def add_notification_button(self, interaction: discord.Interaction, button: ui.Button):
             if await self._reject_wrong_user(interaction):
                 return
-            await interaction.response.send_modal(
-                OptionalPlayerModal(
-                    "Create Notification",
-                    lambda modal_interaction, player_name: _invoke_command(notify, modal_interaction, player_name),
-                )
-            )
+            await notify(interaction)
 
         @ui.button(label="🔕 Remove Notification", style=discord.ButtonStyle.red, custom_id="nba_bot:notification_remove", row=0)
         async def remove_notification_button(self, interaction: discord.Interaction, button: ui.Button):
             if await self._reject_wrong_user(interaction):
                 return
-            await _invoke_command(remove_notify, interaction)
+            await remove_notify(interaction)
 
     def _notification_hub_content(user_id: int) -> str:
         notify_rules = _get_active_notify_rules_for_user(bot, user_id)
@@ -2608,26 +2535,21 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
 
         @ui.button(label="🏷️ List Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=1)
         async def list_player_button(self, interaction: discord.Interaction, button: ui.Button):
-            await _invoke_command(list_a_player, interaction)
+            await list_a_player(interaction)
 
         @ui.button(label="🔨 Auction Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=1)
         async def auction_player_button(self, interaction: discord.Interaction, button: ui.Button):
-            await _invoke_command(auction_a_player, interaction)
+            await auction_a_player(interaction)
 
         @ui.button(label="🔍 Price Search", style=discord.ButtonStyle.blurple, custom_id="nba_bot:price", row=0)
         async def price_button(self, interaction: discord.Interaction, button: ui.Button):
-            await interaction.response.send_modal(
-                OptionalPlayerModal(
-                    "Price Search",
-                    lambda modal_interaction, player_name: _invoke_command(price, modal_interaction, player_name),
-                )
-            )
+            await price(interaction)
 
-        @ui.button(label="📊 Status", style=discord.ButtonStyle.blurple, custom_id="nba_bot:status", row=3)
+        @ui.button(label="📊 View Status", style=discord.ButtonStyle.blurple, custom_id="nba_bot:status", row=3)
         async def status_button(self, interaction: discord.Interaction, button: ui.Button):
-            await _invoke_command(status, interaction)
+            await status(interaction)
 
-        @ui.button(label="🔔 Notifications", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=3)
+        @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=3)
         async def notifications_button(self, interaction: discord.Interaction, button: ui.Button):
             await interaction.response.send_message(
                 _notification_hub_content(interaction.user.id),
@@ -2635,15 +2557,15 @@ def register_commands(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase)
                 ephemeral=True,
             )
 
-        @ui.button(label="❓ Help", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=4)
+        @ui.button(label="❓ Get Help", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=4)
         async def help_button(self, interaction: discord.Interaction, button: ui.Button):
-            await _invoke_command(help_command, interaction)
+            await help_command(interaction)
 
-        @ui.button(label="💬 Feedback", style=discord.ButtonStyle.secondary, custom_id="nba_bot:feedback", row=4)
+        @ui.button(label=f"💬 Leave Feedback{BUTTON_PAD}", style=discord.ButtonStyle.secondary, custom_id="nba_bot:feedback", row=4)
         async def feedback_button(self, interaction: discord.Interaction, button: ui.Button):
-            await _invoke_command(feedback, interaction)
+            await feedback(interaction)
 
-        @ui.button(label="🛒 Marketplace", style=discord.ButtonStyle.blurple, custom_id="nba_bot:open_marketplace", row=0)
+        @ui.button(label=f"🛒 Marketplace{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:open_marketplace", row=0)
         async def open_marketplace_button(self, interaction: discord.Interaction, button: ui.Button):
             await interaction.response.defer(ephemeral=True, thinking=True)
             listings = _get_active_marketplace_listings(bot)

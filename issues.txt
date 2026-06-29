@@ -1,19 +1,12 @@
-Known Issues
-- Issue with importing prices above $999 (comma issue with data)
-
+Known Issues DONE
 
 Need to add
-- When listing is claimed/accepted bid, create chat with bot, seller and buyer for immediate contact.
-
 
 Future nice to haves
-- Bulk listing ability
-- Expanded results/dynamic similar results for price command
-
-
+- Bulk listing ability SOON
 
 Fixed Issues-
-- Missing subsets
+- Missing subsets DONE
     - The Man from Topps Finest, Pulse from Topps Chrome Sapphire, ...
 - Issue with ' characters on mobile/pc.
 - Unable to edit or delete listing
@@ -31,7 +24,9 @@ Fixed Issues-
 - Editing price bumps listing
 - /notify to allow for non player centric notifications
 - Auction Functionality
-
+- Expanded results/dynamic similar results for price command
+- When listing is claimed/accepted bid, create chat with bot, seller and buyer for immediate contact.
+- Issue with importing prices above $999 (comma issue with data)
 
 Notes from Beta
 - Still some people using #want-to-sell that seemingly did not interact with channel.

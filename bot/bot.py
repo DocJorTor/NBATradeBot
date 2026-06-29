@@ -5,9 +5,9 @@ import json
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
-from discord import app_commands, ui
+from discord import ui
 
-from commands import register_commands
+from commands import register_bot_interface
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
 from main import load_config, create_price_sheet, sync_sheet_to_db
@@ -25,6 +25,7 @@ from views import (
 
 ANY_VALUE = "ANY"
 UNAVAILABLE_MESSAGE = object()
+NBA_BOT_INTERFACE_CONTENT = "**NBA Bot**\nUse the buttons below to browse, price, list, auction, and manage your marketplace activity."
 
 
 class StoredDiscordUser:
@@ -102,7 +103,6 @@ class NBACollectBot(discord.Client):
         super().__init__(**kwargs)
         self.sheet = sheet
         self.db = db
-        self.tree = app_commands.CommandTree(self)
         self.sale_channel_id = sale_channel_id
         self.listing_surface_channel_id = listing_surface_channel_id
         self.auction_surface_channel_id = auction_surface_channel_id
@@ -115,9 +115,6 @@ class NBACollectBot(discord.Client):
         self._claim_reminder_task = None
         self._bot_interface_message_id = None
         self.bot_interface_view_factory = None
-
-    async def setup_hook(self):
-        await self.tree.sync()
 
     def start_claim_reminder_loop(self) -> None:
         if self._claim_reminder_task and not self._claim_reminder_task.done():
@@ -197,12 +194,12 @@ class NBACollectBot(discord.Client):
             bot_message = await self._find_interface_message(channel, "NBA Bot")
         if bot_message is None:
             bot_message = await channel.send(
-                content="\u200b",
+                content=NBA_BOT_INTERFACE_CONTENT,
                 view=self.build_bot_interface_view(),
             )
         else:
             await bot_message.edit(
-                content="\u200b",
+                content=NBA_BOT_INTERFACE_CONTENT,
                 embed=None,
                 view=self.build_bot_interface_view(),
             )
@@ -647,7 +644,7 @@ class NBACollectBot(discord.Client):
         return parsed
 
     async def cleanup_stale_auctions_on_startup(self) -> int:
-        """Remove expired non-sold auctions before restoring active marketplace views."""
+        """Leave ended auctions restorable so sellers can finalize them."""
         now = datetime.now(timezone.utc)
         try:
             rows = self.db.conn.execute(
@@ -671,26 +668,18 @@ class NBACollectBot(discord.Client):
             if end_at is None or end_at > now:
                 continue
 
-            previous_status = listing.get("status")
-            listing["status"] = "removed"
-            await self.delete_listing_messages(listing)
-            self.db.update_marketplace_listing_status(listing["message_id"], "removed")
-            removed_count += 1
             log_marketplace_event(
                 self.db,
-                "stale_auction_removed",
+                "ended_auction_restored_for_finalization",
                 user_id=listing.get("seller_id"),
                 listing_id=listing.get("message_id"),
                 details={
                     "player_names": listing.get("player_names"),
-                    "previous_status": previous_status,
                     "auction_end_at": listing.get("auction_end_at"),
                     "context": "startup",
                 },
             )
 
-        if removed_count:
-            LOGGER.info("Removed %s stale auction(s) during startup.", removed_count)
         return removed_count
 
     async def safe_dm_user(self, user: discord.abc.User, *, content: str = None, embed: discord.Embed = None, view: ui.View = None) -> bool:
@@ -1692,18 +1681,14 @@ def main():
         intents=intents,
     )
 
-    register_commands(bot, sheet, db)
+    register_bot_interface(bot, sheet, db)
 
     @bot.event
     async def on_ready():
-        guild = discord.Object(id=int(config["discord_guild_id"]))
-        await bot.tree.sync(guild=guild)
         await bot.restore_marketplace_state()
         await bot.ensure_nba_bot_interfaces()
         bot.start_claim_reminder_loop()
         LOGGER.info("Discord bot is ready.")
-
-        print(f"Synced commands to {guild.id}")
 
     bot.run(config["discord_token"])
 

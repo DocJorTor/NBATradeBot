@@ -732,23 +732,46 @@ class CardDatabase:
 
         query += """
             ORDER BY
-                date(substr(date_time, 9, 4) || '-' ||
-                    CASE substr(date_time, 1, 3)
-                        WHEN 'Jan' THEN '01'
-                        WHEN 'Feb' THEN '02'
-                        WHEN 'Mar' THEN '03'
-                        WHEN 'Apr' THEN '04'
-                        WHEN 'May' THEN '05'
-                        WHEN 'Jun' THEN '06'
-                        WHEN 'Jul' THEN '07'
-                        WHEN 'Aug' THEN '08'
-                        WHEN 'Sep' THEN '09'
-                        WHEN 'Oct' THEN '10'
-                        WHEN 'Nov' THEN '11'
-                        WHEN 'Dec' THEN '12'
-                    END || '-' ||
-                    printf('%02d', CAST(replace(substr(date_time, 5, 2), ',', '') AS INTEGER))
-                ) DESC
+                COALESCE(
+                    date(date_time),
+                    CASE
+                        WHEN instr(date_time, ' ') > 0 AND instr(date_time, ',') > instr(date_time, ' ') THEN
+                            date(
+                                trim(substr(date_time, instr(date_time, ',') + 1)) || '-' ||
+                                CASE lower(substr(date_time, 1, instr(date_time, ' ') - 1))
+                                    WHEN 'jan' THEN '01'
+                                    WHEN 'january' THEN '01'
+                                    WHEN 'feb' THEN '02'
+                                    WHEN 'february' THEN '02'
+                                    WHEN 'mar' THEN '03'
+                                    WHEN 'march' THEN '03'
+                                    WHEN 'apr' THEN '04'
+                                    WHEN 'april' THEN '04'
+                                    WHEN 'may' THEN '05'
+                                    WHEN 'jun' THEN '06'
+                                    WHEN 'june' THEN '06'
+                                    WHEN 'jul' THEN '07'
+                                    WHEN 'july' THEN '07'
+                                    WHEN 'aug' THEN '08'
+                                    WHEN 'august' THEN '08'
+                                    WHEN 'sep' THEN '09'
+                                    WHEN 'sept' THEN '09'
+                                    WHEN 'september' THEN '09'
+                                    WHEN 'oct' THEN '10'
+                                    WHEN 'october' THEN '10'
+                                    WHEN 'nov' THEN '11'
+                                    WHEN 'november' THEN '11'
+                                    WHEN 'dec' THEN '12'
+                                    WHEN 'december' THEN '12'
+                                END || '-' ||
+                                printf(
+                                    '%02d',
+                                    CAST(substr(date_time, instr(date_time, ' ') + 1, instr(date_time, ',') - instr(date_time, ' ') - 1) AS INTEGER)
+                                )
+                            )
+                    END
+                ) DESC,
+                id DESC
             LIMIT ?
         """
         params.append(limit)
