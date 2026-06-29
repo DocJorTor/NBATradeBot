@@ -211,6 +211,14 @@ class PriceResultsView(ui.View):
             self.save_button.callback = self.on_save
             self.add_item(self.save_button)
 
+        self.close_button = ui.Button(
+            label="Close Results",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        self.close_button.callback = self.on_close
+        self.add_item(self.close_button)
+
     async def _reject_wrong_user(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
             return False
@@ -306,3 +314,15 @@ class PriceResultsView(ui.View):
             )
             return
         await self.save_callback(interaction)
+
+    async def on_close(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        try:
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+        except (discord.NotFound, discord.HTTPException):
+            try:
+                await interaction.message.edit(content="Search results closed.", embeds=[], view=None)
+            except discord.DiscordException:
+                pass

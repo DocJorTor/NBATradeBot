@@ -2619,6 +2619,7 @@ class CounterOfferView(ui.View):
             await interaction.response.send_message("Only the buyer can accept this counter offer.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         self.refresh_bid_record()
         if self.listing_data.get("status") != "active":
             await self.close_counter_message(interaction, "This listing is no longer active.")
@@ -2659,6 +2660,7 @@ class CounterOfferView(ui.View):
             await interaction.response.send_message("Only the buyer can decline this counter offer.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         self.refresh_bid_record()
         if self.listing_data.get("status") != "active":
             await self.close_counter_message(interaction, "This listing is no longer active.")

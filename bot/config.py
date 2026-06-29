@@ -15,12 +15,12 @@ SET_SUBSETS = {
         {f'{VARIANT_PREFIX_MARKER}Signatures': ['Gold', 'Red', 'Black']},
         'Blue', 'Orange', 'Red', 'Black', 'Entry Pack Signatures AWARD',
         'Foilfractor', 'Foilfractor Signatures',
-        {f'{VARIANT_PREFIX_MARKER}Signatures AWARD': ['Orange', 'Gold']}],
+        {f'{VARIANT_PREFIX_MARKER}Signatures AWARD': ['Orange', 'Gold']}, 'Topps Flagship Hobby Box'],
     '2025-26 Topps Now': ['Gold', 'Green', 'Orange', 'Black', 'Red', 'Foilfractor'],
     '2025-26 Topps Chrome': ['Gold Wave',
         {f'{VARIANT_PREFIX_MARKER}Signatures': ['Gold', 'Blue', 'Red', 'Green', 'Orange', 'Purple', 'Superfractor', 'Black']},
         'Superfractor', 'Signature Style', 'Frozenfractor', 'Ultraviolet All Stars', 'The Finals', 'Rock Stars', 'Future Stars',
-        'Paradox', 'Glass Canvas', 'Patented', 'Helix', "Let's Go!"],
+        'Paradox', 'Glass Canvas', 'Patented', 'Helix', "Let's Go!", 'Topps Chrome Hobby Box'],
     '2026 Topps Midnight': [
         {f'{VARIANT_PREFIX_MARKER}Base': ['Black Light', 'Moonbeam']},
         {f'{VARIANT_PREFIX_MARKER}Midnight Sun Signatures': ['Black Light', 'Moonbeam', 'Moonrise']},
@@ -44,7 +44,7 @@ SET_SUBSETS = {
         {'Finest Signatures': ['Gold', 'Orange', 'Red', 'Superfractor']},
         {'Baseline Signatures': ['Gold', 'Orange', 'Red', 'Superfractor']},
         'Purple Geometric Common',
-        'Superfractor', 'The Man', 'Pulse', 'Orange Geometric Rookie Signatures'],
+        'Superfractor', 'The Man', 'Pulse', 'Orange Geometric Rookie Signatures', 'Topps Finest Hobby Box'],
     '2026 Chromatographs': [{f'{VARIANT_PREFIX_MARKER}Signatures': ['Black', 'Red', 'Superfractor']}],
     '2025 Topps 1952': ['Blue', 'Gold', 'Black', 'Foilfractor'],
     '2025 Inception Black': ['Base', 'Mercurial Booklet', 'Mercurial Relic Signatures', 'Superfractor Logoman', 'Volcanic Base', 'Volcanic Booklet', 
@@ -98,9 +98,11 @@ SET_SUBSETS = {
         {f'{VARIANT_PREFIX_MARKER}Signature': ['Orange Galactic', 'Gold Interstellar', 'Black Eclipse', 'Red Flare', 'Superfractor']}, {f'{VARIANT_PREFIX_MARKER}Singularitry Signatures': ['Orange Galactic', 'Gold Interstellar', 'Black Eclipse', 'Red Flare', 'Superfractor']},
         {f'{VARIANT_PREFIX_MARKER}Alien Autographs': ['Orange Galactic', 'Gold Interstellar', 'Black Eclipse', 'Red Flare', 'Superfractor']},
         {f'{VARIANT_PREFIX_MARKER}Electro-Static Signatures': ['Orange Galactic', 'Gold Interstellar', 'Black Eclipse', 'Red Flare', 'Superfractor']}, {f'{VARIANT_PREFIX_MARKER}First Flight Signatures': ['Orange Galactic', 'Gold Interstellar', 'Black Eclipse', 'Red Flare', 'Superfractor']},
-        'Superfractor Extraterrestrial Talent', 'Superfractor Propulsion', 'Superfractor Space Walk'],
+        'Superfractor Extraterrestrial Talent', 'Superfractor Propulsion', 'Superfractor Space Walk', 'Topps Chrome Cosmic Hobby Box'],
     '2026 Topps Three': ['Gold Base', 'Red Base', 'Rim Reapers Gold'],
     '2026 Topps Three Rookie Signatures': ['Gold Rookie Signature', 'Red Rookie Signature'],
+    '2026 Generation Rising': ['Red'],
+    '2026 Planetary Pursuit': ['Jupiter', 'Pluto', 'Neptune', 'Saturn', 'Uranus', 'Solar System AWARD'],
 }
 
 

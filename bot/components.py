@@ -1,6 +1,7 @@
 import discord
 from difflib import SequenceMatcher
 import re
+from typing import Awaitable, Callable
 
 from config import (
     format_subset_for_set,
@@ -14,6 +15,13 @@ ANY_VALUE = "ANY"
 UNLIMITED_VALUE = 999
 NO_SETS_VALUE = "__no_sets__"
 NO_SUBSETS_VALUE = "__no_subsets__"
+
+PlayerNameCallback = Callable[[discord.Interaction, str | None], Awaitable[None]]
+PlayerNameNormalizer = Callable[[str | None], str | None]
+
+
+def _include_any_options(view) -> bool:
+    return getattr(view, "include_any_options", True)
 
 
 def _normalize_search(value: str) -> str:
@@ -50,6 +58,33 @@ def _selected_content(view, fallback: str) -> str:
     if callable(summary):
         return summary()
     return fallback
+
+
+class PlayerNamePromptModal(discord.ui.Modal):
+    def __init__(
+        self,
+        title: str,
+        callback: PlayerNameCallback,
+        *,
+        normalizer: PlayerNameNormalizer | None = None,
+        initial_value: str | None = None,
+    ):
+        super().__init__(title=title)
+        self.callback_fn = callback
+        self.normalizer = normalizer
+        self.player_name = discord.ui.TextInput(
+            label="Player Name",
+            default=str(initial_value or "")[:4000],
+            required=False,
+            max_length=120,
+        )
+        self.add_item(self.player_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        player_name = str(self.player_name.value or "").strip()
+        if self.normalizer is not None:
+            player_name = self.normalizer(player_name)
+        await self.callback_fn(interaction, player_name or None)
 
 
 async def _refresh_search_view(interaction: discord.Interaction, view, message: str) -> None:
@@ -97,11 +132,14 @@ class SetSearchModal(discord.ui.Modal, title="Search Set"):
             if getattr(self.parent_view, "subset_required", False):
                 self.parent_view.subset_select.placeholder = "Select Subset"
             else:
-                self.parent_view.subset_select.placeholder = "Select Subset (optional)"
+                self.parent_view.subset_select.placeholder = "Select Subset"
         if hasattr(self.parent_view, "variant_select"):
             self.parent_view.variant_select.disabled = True
             self.parent_view.variant_select.options = build_variant_options(self.parent_view)
             self.parent_view.variant_select.placeholder = "Select Variant"
+        sync_items = getattr(self.parent_view, "sync_filter_items", None)
+        if callable(sync_items):
+            sync_items()
 
         message = _selected_content(
             self.parent_view,
@@ -200,12 +238,12 @@ def _placeholder_option(label: str, value: str) -> discord.SelectOption:
 
 def build_set_options(self):
     options = []
-    if getattr(self, "set_optional", False):
+    if getattr(self, "set_optional", False) and _include_any_options(self):
         options.append(
             discord.SelectOption(
                 label="Any",
                 value=ANY_VALUE,
-                default=self.set_value in (None, "", ANY_VALUE),
+                default=self.set_value == ANY_VALUE,
             )
         )
     set_names = get_set_names()
@@ -236,11 +274,13 @@ def build_set_options(self):
 
 def build_subset_options(self):
     if not self.set_value or self.set_value == ANY_VALUE:
-        return [discord.SelectOption(label="Any", value=ANY_VALUE, default=True)]
+        if not _include_any_options(self):
+            return [discord.SelectOption(label="Select a set first", value="select_set_first")]
+        return [discord.SelectOption(label="Any", value=ANY_VALUE)]
     selected_group = getattr(self, "subset_group_value", None) or self.subset_value
-    any_is_selected = selected_group in (None, "", ANY_VALUE)
+    any_is_selected = selected_group == ANY_VALUE
     options = []
-    if not getattr(self, "subset_required", False):
+    if not getattr(self, "subset_required", False) and _include_any_options(self):
         options.append(
             discord.SelectOption(
                 label="Any",
@@ -297,12 +337,14 @@ def build_variant_options(self):
     ][:25]
 
 
-def build_card_count_options(selected_value: str | None = ANY_VALUE) -> list[discord.SelectOption]:
+def build_card_count_options(
+    selected_value: str | None = ANY_VALUE,
+    *,
+    include_any: bool = True,
+) -> list[discord.SelectOption]:
     card_counts = [1, 3, 5, 10, 15, 25, 35, 50, 75, 99, 100]
     cc_counts = [250, 500, 1000]
-
-    return [
-        make_option("Any Card Count", ANY_VALUE, selected_value),
+    options = [
         *[
             make_option(str(n), str(n), selected_value)
             for n in card_counts
@@ -313,6 +355,9 @@ def build_card_count_options(selected_value: str | None = ANY_VALUE) -> list[dis
         ],
         make_option("Unlimited", str(UNLIMITED_VALUE), selected_value),
     ]
+    if include_any:
+        options.insert(0, make_option("Any Card Count", ANY_VALUE, selected_value))
+    return options
 
 
 async def on_card_count_select(self, interaction: discord.Interaction):
@@ -357,7 +402,7 @@ async def on_set_select(self, interaction: discord.Interaction, required: bool):
         self.variant_select.options = build_variant_options(self)
         self.variant_select.placeholder = "Select Variant"
     if not required:
-        self.subset_select.placeholder = "Select Subset (optional)"
+        self.subset_select.placeholder = "Select Subset"
     else:
         self.subset_select.placeholder = "Select Subset"
     summary = getattr(self, "selected_summary", None)

@@ -9,6 +9,14 @@ from price_assist import build_price_assist
 from serializers import build_listing_embed
 
 
+def _attachment_is_image(attachment: discord.Attachment) -> bool:
+    content_type = str(getattr(attachment, "content_type", "") or "").lower()
+    if content_type.startswith("image/"):
+        return True
+    filename = str(getattr(attachment, "filename", "") or "").lower()
+    return filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+
 async def delete_message_if_possible(message: discord.Message, interaction: discord.Interaction = None) -> bool:
     try:
         await message.delete()
@@ -52,12 +60,15 @@ async def collect_listing_image(
         msg = await bot.wait_for("message", timeout=120, check=check)
         attachment = msg.attachments[0]
 
-        if not attachment.content_type or not attachment.content_type.startswith("image/"):
+        if not _attachment_is_image(attachment):
             log_marketplace_event(
                 db,
                 "listing_image_invalid",
                 user_id=interaction.user.id,
-                details={"content_type": attachment.content_type},
+                details={
+                    "content_type": attachment.content_type,
+                    "filename": getattr(attachment, "filename", None),
+                },
                 level=30,
             )
             await interaction.followup.send(
