@@ -1,3 +1,5 @@
+<img width="1008" height="257" alt="Screenshot 2026-07-06 012345" src="https://github.com/user-attachments/assets/043748a9-6c44-4400-a7fb-b2cc6a5b74bd" />
+
 # NBACollectEval
 
 Discord marketplace bot for NBA digital card trading communities. The bot runs a button-driven interface in `#nba-bot`, supports fixed-price listings and auctions, provides price lookup from historical sales, tracks user notification rules, and persists marketplace state in SQLite so active listings survive restarts.
