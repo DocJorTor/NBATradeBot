@@ -6,7 +6,7 @@
 
 Discord marketplace bot for NBA digital card trading communities. The bot runs a button-driven interface in `#nba-bot`, supports fixed-price listings and auctions, provides price lookup from historical sales, tracks user notification rules, and persists marketplace state in SQLite so active listings survive restarts.
 
-Slash commands are deprecated. User actions are expected to start from the persistent `NBA Bot` interface message in the configured bot channel.
+User actions are expected to start from the persistent `NBA Bot` interface message in the configured bot channel.
 
 ## Core Features
 
