@@ -25,6 +25,7 @@ CARD_COUNT_SUBSET_FALLBACKS = [
     ("orange", 25),
     ("gold", 50),
 ]
+ONE_OF_ONE_SUBSET_MARKERS = ("superfractor", "foilfractor", "platinum")
 
 
 @dataclass
@@ -42,7 +43,6 @@ class ListingMetadataGuess:
     subset_option_order: list[str] = field(default_factory=list)
     variant_option_order: list[str] = field(default_factory=list)
     confidence: dict[str, float] = field(default_factory=dict)
-    image_was_cropped: bool = False
     card_count_source: str | None = None
     card_rarity: str | None = None
     card_rarity_source: str | None = None
@@ -188,57 +188,6 @@ def _score_player_candidate(text: str, player_name: str) -> float:
     return best_score
 
 
-def crop_card_image(image_bytes: bytes | None) -> tuple[bytes | None, bool]:
-    """Crop obvious surrounding whitespace/background while preserving the card."""
-    if not image_bytes:
-        return image_bytes, False
-    try:
-        from PIL import Image, ImageChops, ImageOps, ImageStat
-    except ImportError:
-        return image_bytes, False
-
-    try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        original_w, original_h = image.size
-        if original_w < 100 or original_h < 100:
-            return image_bytes, False
-
-        border_pixels = [
-            image.getpixel((0, 0)),
-            image.getpixel((original_w - 1, 0)),
-            image.getpixel((0, original_h - 1)),
-            image.getpixel((original_w - 1, original_h - 1)),
-        ]
-        bg = tuple(int(sum(pixel[channel] for pixel in border_pixels) / len(border_pixels)) for channel in range(3))
-        background = Image.new("RGB", image.size, bg)
-        diff = ImageChops.difference(image, background).convert("L")
-        threshold = max(18, int(ImageStat.Stat(diff).mean[0] * 1.8))
-        mask = diff.point(lambda value: 255 if value > threshold else 0)
-        mask = ImageOps.expand(mask, border=6, fill=0)
-        bbox = mask.getbbox()
-        if not bbox:
-            return image_bytes, False
-
-        left, top, right, bottom = bbox
-        left = max(0, left - 8)
-        top = max(0, top - 8)
-        right = min(original_w, right + 8)
-        bottom = min(original_h, bottom + 8)
-        crop_w = right - left
-        crop_h = bottom - top
-        original_area = original_w * original_h
-        crop_area = crop_w * crop_h
-        if crop_area < original_area * 0.25 or crop_area > original_area * 0.98:
-            return image_bytes, False
-
-        cropped = image.crop((left, top, right, bottom))
-        output = io.BytesIO()
-        cropped.save(output, format="PNG", optimize=True)
-        return output.getvalue(), True
-    except Exception:
-        return image_bytes, False
-
-
 def _crop_regions_for_ocr(image):
     width, height = image.size
     regions = [
@@ -258,8 +207,28 @@ def _prepare_ocr_image(image):
     return ImageEnhance.Contrast(gray).enhance(1.8)
 
 
+def _contains_one_of_one(text: str) -> bool:
+    """Recognize a 1/1 serial, including common OCR substitutions for one."""
+    raw_text = str(text or "")
+    one_glyph = r"[1Il|]"
+    if re.search(
+        rf"(?<![A-Za-z0-9]){one_glyph}\s*[/\\]\s*{one_glyph}(?![A-Za-z0-9])",
+        raw_text,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:1|one)\s+(?:of|out\s+of)\s+(?:1|one)\b",
+            raw_text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _extract_card_count(text: str) -> int | None:
     normalized = str(text or "")
+    if _contains_one_of_one(normalized):
+        return 1
     for match in re.finditer(r"(?:/|out\s+of\s+)(\d{1,4})\b", normalized, re.IGNORECASE):
         value = int(match.group(1))
         if value > 1:
@@ -329,6 +298,9 @@ def _extract_bottom_pill_count(image_bytes: bytes | None) -> int | None:
                 )
             except Exception:
                 continue
+            parsed_count = _extract_card_count(text)
+            if parsed_count is not None:
+                return parsed_count
             numbers = [int(value) for value in re.findall(r"\d{1,4}", text or "")]
             if not numbers:
                 continue
@@ -611,6 +583,55 @@ def _apply_color_subset_guess(guess: ListingMetadataGuess, image_bytes: bytes | 
         guess.variant_option_order.insert(0, variant)
 
 
+def _apply_one_of_one_subset_guard(guess: ListingMetadataGuess) -> None:
+    """Replace a color-only Orange/Gold guess with a configured 1/1 parallel."""
+    if guess.card_count != 1 or not guess.set_name:
+        return
+
+    current_text = _normalize(" ".join([
+        str(guess.subset_value or ""),
+        str(guess.subset_variant or ""),
+    ]))
+    if current_text and not any(color in current_text.split() for color in ("orange", "gold")):
+        return
+
+    candidates: list[tuple[int, int, str, str | None, str]] = []
+    preferred_group = guess.subset_group
+    for group in get_subset_groups(guess.set_name):
+        variants = get_subset_variants(guess.set_name, group)
+        configured = [(None, group)] if not variants else [
+            (variant, format_subset_for_set(guess.set_name, group, variant))
+            for variant in variants
+        ]
+        for variant, final_subset in configured:
+            normalized_subset = _normalize(final_subset)
+            marker_rank = next(
+                (
+                    index for index, marker in enumerate(ONE_OF_ONE_SUBSET_MARKERS)
+                    if marker in normalized_subset
+                ),
+                None,
+            )
+            if marker_rank is None:
+                continue
+            context_rank = 0 if preferred_group and group == preferred_group else 1
+            candidates.append((context_rank, marker_rank, group, variant, final_subset))
+
+    if not candidates:
+        return
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _context_rank, _marker_rank, group, variant, final_subset = candidates[0]
+    guess.subset_group = group
+    guess.subset_variant = variant
+    guess.subset_value = final_subset
+    guess.confidence["subset_one_of_one"] = 0.86
+    if group not in guess.subset_option_order:
+        guess.subset_option_order.insert(0, group)
+    if variant and variant not in guess.variant_option_order:
+        guess.variant_option_order.insert(0, variant)
+
+
 def _apply_subset_guess(guess: ListingMetadataGuess, text: str) -> None:
     if not guess.set_name:
         return
@@ -720,13 +741,18 @@ def extract_listing_metadata(
     guess.ocr_available = available
     guess.card_count = _extract_card_count(text)
     if guess.card_count is not None:
-        guess.card_count_source = "ocr_text"
+        guess.card_count_source = "ocr_one_of_one" if guess.card_count == 1 and _contains_one_of_one(text) else "ocr_text"
     else:
         guess.card_count = _extract_bottom_pill_count(image_bytes)
         if guess.card_count is not None:
-            guess.card_count_source = "bottom_pill"
+            guess.card_count_source = "bottom_pill_one_of_one" if guess.card_count == 1 else "bottom_pill"
     if guess.card_count is not None:
-        guess.confidence["card_count"] = 0.7 if guess.card_count_source == "bottom_pill" else 0.75
+        if guess.card_count_source == "ocr_one_of_one":
+            guess.confidence["card_count"] = 0.9
+        elif guess.card_count_source == "bottom_pill_one_of_one":
+            guess.confidence["card_count"] = 0.82
+        else:
+            guess.confidence["card_count"] = 0.7 if guess.card_count_source == "bottom_pill" else 0.75
     guess.card_rarity = _normalize_card_rarity(text)
     if guess.card_rarity:
         guess.card_rarity_source = "ocr_text"
@@ -744,6 +770,7 @@ def extract_listing_metadata(
         guess.confidence["set_name"] = score
         _apply_subset_guess(guess, text)
         _apply_color_subset_guess(guess, image_bytes)
+        _apply_one_of_one_subset_guard(guess)
 
     _apply_card_count_subset_fallback(guess, text)
 

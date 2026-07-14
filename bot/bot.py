@@ -5,7 +5,7 @@ import json
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
-from discord import ui
+from discord import app_commands, ui
 
 from commands import register_bot_interface
 from database import CardDatabase
@@ -23,8 +23,9 @@ from views import (
     ListingActionView,
 )
 
-ANY_VALUE = "ANY"
 UNAVAILABLE_MESSAGE = object()
+SELLER_RECONCILIATION_INTERVAL_SECONDS = 60 * 60
+CLAIM_REMINDER_INTERVAL_SECONDS = 60 * 60
 NBA_BOT_INTERFACE_CONTENT = "**NBA Bot**\nUse the buttons below to browse, price, list, auction, and manage your marketplace activity."
 
 
@@ -40,6 +41,32 @@ class StoredDiscordUser:
 
 def _mention_user(user: discord.abc.User) -> str:
     return getattr(user, "mention", None) or f"<@{getattr(user, 'id', user)}>"
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _listing_newest_sort_key(listing: dict) -> tuple[datetime, int]:
+    timestamp = (
+        _parse_iso_datetime(listing.get("created_at"))
+        or _parse_iso_datetime(listing.get("updated_at"))
+    )
+    message_id = listing.get("message_id")
+    if timestamp is None and message_id:
+        try:
+            timestamp = discord.utils.snowflake_time(int(message_id))
+        except (TypeError, ValueError):
+            timestamp = None
+    return timestamp or datetime.min.replace(tzinfo=timezone.utc), int(message_id or 0)
 
 
 class ClaimReminderView(ClaimedListingView):
@@ -95,6 +122,7 @@ class NBACollectBot(discord.Client):
         sheet: PriceSheet,
         db: CardDatabase,
         sale_channel_id: int = None,
+        auction_channel_id: int = None,
         listing_surface_channel_id: int = None,
         auction_surface_channel_id: int = None,
         config: dict = None,
@@ -104,31 +132,179 @@ class NBACollectBot(discord.Client):
         self.sheet = sheet
         self.db = db
         self.sale_channel_id = sale_channel_id
+        self.auction_channel_id = auction_channel_id or auction_surface_channel_id or sale_channel_id
         self.listing_surface_channel_id = listing_surface_channel_id
         self.auction_surface_channel_id = auction_surface_channel_id
         self.config = config or {}
         self.active_listings: Dict[int, Dict[str, Any]] = {}
-        self.user_uploaded_images: Dict[int, str] = {}  # user_id -> image url
         self.notify_rules = []
         self._hydrated_users: Dict[int, discord.abc.User] = {}
         self._marketplace_state_restored = False
         self._claim_reminder_task = None
+        self._seller_reconciliation_task = None
         self._bot_interface_message_id = None
         self.bot_interface_view_factory = None
+        self._slash_cleanup_complete = False
+        self._marketplace_locks: Dict[int, asyncio.Lock] = {}
+        # This tree exists only to clear commands registered by older releases.
+        self.command_tree = app_commands.CommandTree(self)
+
+    def marketplace_lock(self, listing_id: int | str | None) -> asyncio.Lock:
+        """Return the process-local lock for one marketplace listing."""
+        key = int(listing_id or 0)
+        lock = self._marketplace_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._marketplace_locks[key] = lock
+        return lock
+
+    async def remove_legacy_slash_commands(self) -> None:
+        """Remove global and guild slash commands left behind by older releases."""
+        if self._slash_cleanup_complete:
+            return
+        try:
+            self.command_tree.clear_commands(guild=None)
+            await self.command_tree.sync()
+            for guild in self.guilds:
+                self.command_tree.clear_commands(guild=guild)
+                await self.command_tree.sync(guild=guild)
+        except discord.DiscordException:
+            LOGGER.exception("Could not remove all legacy slash commands; cleanup will retry on reconnect.")
+            return
+        self._slash_cleanup_complete = True
+        LOGGER.info("Legacy slash commands removed globally and from %s guild(s).", len(self.guilds))
+
+    async def remove_seller_listings(
+        self,
+        seller_id: int,
+        guild_id: int,
+        *,
+        event_type: str,
+    ) -> int:
+        """Remove a seller's non-final listings belonging to one guild."""
+        removable_statuses = {"active", "open", "claimed", "pending"}
+        listings = [
+            listing
+            for listing in list(self.active_listings.values())
+            if int(listing.get("seller_id") or 0) == int(seller_id)
+            and (
+                int(listing.get("guild_id") or 0) == int(guild_id)
+                or (not listing.get("guild_id") and len(self.guilds) == 1)
+            )
+            and str(listing.get("status", "active")).lower() in removable_statuses
+        ]
+        removed = 0
+        for listing in listings:
+            listing_id = listing.get("message_id")
+            if not listing_id:
+                continue
+            async with self.marketplace_lock(int(listing_id)):
+                transitioned = self.db.transition_marketplace_listing(
+                    int(listing_id),
+                    expected_statuses=removable_statuses,
+                    new_status="removed",
+                    resolution_reason="Seller left the server",
+                )
+                if not transitioned:
+                    continue
+                listing["status"] = "removed"
+                self.active_listings.pop(int(listing_id), None)
+                removed += 1
+            await self.delete_listing_messages(listing)
+            if listing.get("deal_thread_id"):
+                await self.close_deal_thread_action_messages(
+                    listing,
+                    content="This deal was closed because the seller is no longer in the server.",
+                )
+                await self.delete_deal_thread(
+                    listing,
+                    reason="Marketplace seller left server",
+                )
+            log_marketplace_event(
+                self.db,
+                event_type,
+                user_id=seller_id,
+                listing_id=listing_id,
+                details={
+                    "guild_id": guild_id,
+                    "player_names": listing.get("player_names"),
+                },
+            )
+        if removed:
+            LOGGER.info("Removed %s listing(s) for absent member %s.", removed, seller_id)
+        return removed
+
+    async def remove_departed_member_listings(self, member: discord.Member) -> int:
+        """Remove listings when Discord reports that their seller left."""
+        return await self.remove_seller_listings(
+            member.id,
+            member.guild.id,
+            event_type="listing_removed_member_left",
+        )
+
+    async def reconcile_absent_seller_listings(self) -> int:
+        """Remove listings whose sellers are no longer members of their guild."""
+        seller_guild_pairs = set()
+        for listing in self.active_listings.values():
+            seller_id = listing.get("seller_id")
+            guild_id = listing.get("guild_id")
+            if not guild_id and len(self.guilds) == 1:
+                guild_id = self.guilds[0].id
+            if seller_id and guild_id:
+                seller_guild_pairs.add((int(seller_id), int(guild_id)))
+
+        removed = 0
+        for seller_id, guild_id in seller_guild_pairs:
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                LOGGER.warning("Cannot verify listing seller %s: guild %s is unavailable.", seller_id, guild_id)
+                continue
+            try:
+                await guild.fetch_member(seller_id)
+            except discord.NotFound:
+                removed += await self.remove_seller_listings(
+                    seller_id,
+                    guild_id,
+                    event_type="listing_removed_absent_member",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                LOGGER.warning(
+                    "Could not verify whether listing seller %s belongs to guild %s; listings preserved.",
+                    seller_id,
+                    guild_id,
+                )
+        LOGGER.info("Startup seller reconciliation removed %s listing(s).", removed)
+        return removed
 
     def start_claim_reminder_loop(self) -> None:
         if self._claim_reminder_task and not self._claim_reminder_task.done():
             return
         self._claim_reminder_task = asyncio.create_task(self.claim_reminder_loop())
 
+    def start_seller_reconciliation_loop(self) -> None:
+        if self._seller_reconciliation_task and not self._seller_reconciliation_task.done():
+            return
+        self._seller_reconciliation_task = asyncio.create_task(self.seller_reconciliation_loop())
+
+    async def seller_reconciliation_loop(self) -> None:
+        """Periodically remove listings for sellers who are no longer members."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(SELLER_RECONCILIATION_INTERVAL_SECONDS)
+            try:
+                await self.reconcile_absent_seller_listings()
+            except Exception:
+                LOGGER.exception("Seller membership reconciliation failed")
+
     async def claim_reminder_loop(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():
             try:
                 await self.send_claim_reminders_once()
+                await self.send_auction_end_reminders_once()
             except Exception:
                 LOGGER.exception("Claim reminder loop failed")
-            await asyncio.sleep(60 * 60)
+            await asyncio.sleep(CLAIM_REMINDER_INTERVAL_SECONDS)
 
     def _active_marketplace_listings(self) -> list[dict]:
         listings = [
@@ -136,13 +312,7 @@ class NBACollectBot(discord.Client):
             for listing in (self.active_listings or {}).values()
             if str(listing.get("status", "active")).lower() in {"active", "open"}
         ]
-        listings.sort(
-            key=lambda listing: (
-                str(listing.get("date_time") or ""),
-                int(listing.get("message_id") or 0),
-            ),
-            reverse=True,
-        )
+        listings.sort(key=_listing_newest_sort_key, reverse=True)
         return listings
 
     def build_bot_interface_view(self) -> ui.View | None:
@@ -307,8 +477,8 @@ class NBACollectBot(discord.Client):
                         f"Card: {listing.get('player_names', 'Unknown card')}\n"
                         f"Buyer: {getattr(buyer, 'mention', listing.get('buyer_name') or 'Unknown buyer')}\n"
                         f"Price: ${float(listing.get('price') or 0):.2f}\n\n"
-                        "If payment was received and the card was delivered, use Record Transaction. "
-                        "If payment was not received, coordinate with the buyer or cancel the claim."
+                        "After the buyer marks payment sent and the card is delivered, use Confirm Transfer & Complete. "
+                        "If payment was not received, coordinate with the buyer or use Cancel / Void Deal."
                     ),
                     color=discord.Color.gold(),
                 )
@@ -321,13 +491,20 @@ class NBACollectBot(discord.Client):
                 mod_channel_id = self.config.get("mod_channel_id")
                 channel = await self.fetch_channel_safely(mod_channel_id) if mod_channel_id else None
                 if channel:
+                    listing["seller"] = await self.hydrate_user(
+                        listing.get("seller_id"), listing.get("seller_name"), fetch=False
+                    )
+                    listing["buyer"] = await self.hydrate_user(
+                        listing.get("buyer_id"), listing.get("buyer_name"), fetch=False
+                    )
                     await channel.send(
                         "Stale claimed listing needs review:\n"
                         f"Card: **{listing.get('player_names', 'Unknown card')}**\n"
                         f"Seller: <@{listing.get('seller_id')}>\n"
                         f"Buyer: <@{listing.get('buyer_id')}>\n"
-                        f"Price: ${float(listing.get('price') or 0):.2f}\n"
-                        f"Claimed since: `{listing.get('updated_at')}`"
+                        f"Price: ${float(listing.get('claim_price') or listing.get('price') or 0):.2f}\n"
+                        f"Claimed since: `{listing.get('claimed_at') or listing.get('updated_at')}`",
+                        view=ClaimedListingView(self, self.db, listing),
                     )
                     sent = True
 
@@ -344,17 +521,110 @@ class NBACollectBot(discord.Client):
                     },
                 )
 
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
+    async def send_auction_end_reminders_once(self) -> None:
+        """Notify sellers once when an auction is ready to finalize."""
+        now = datetime.now(timezone.utc)
+        for listing in list(self.active_listings.values()):
+            if listing.get("listing_type") != "auction" or str(listing.get("status", "")).lower() != "active":
+                continue
+            end_at = self._parse_datetime(listing.get("auction_end_at"))
+            listing_id = listing.get("message_id")
+            if not listing_id or end_at is None or end_at > now:
+                continue
+            already_sent = self.db.conn.execute(
+                """
+                SELECT 1 FROM marketplace_events
+                WHERE event_type = 'auction_end_reminder_sent' AND listing_id = ?
+                LIMIT 1
+                """,
+                (int(listing_id),),
+            ).fetchone()
+            if already_sent:
+                continue
+            seller = await self.hydrate_user(
+                listing.get("seller_id"),
+                listing.get("seller_name"),
+                fetch=True,
+            )
+            sent = await self.safe_dm_user(
+                seller,
+                embed=discord.Embed(
+                    title="Auction Ready to Finalize",
+                    description=(
+                        f"Your auction for **{listing.get('player_names', 'this card')}** has ended. "
+                        "Use Finalize Auction to select the high bidder or close it with no winner."
+                    ),
+                    color=discord.Color.gold(),
+                ),
+                view=AuctionActionView(self, self.db, listing),
+            )
+            if sent:
+                log_marketplace_event(
+                    self.db,
+                    "auction_end_reminder_sent",
+                    user_id=listing.get("seller_id"),
+                    listing_id=listing_id,
+                )
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
-        if payload.message_id in self.active_listings:
-            self.db.update_marketplace_listing_status(payload.message_id, "removed")
-            del self.active_listings[payload.message_id]
-            LOGGER.info(
-                f"Removed deleted listing {payload.message_id} from active listings."
+        listing = self.active_listings.get(payload.message_id)
+        if listing is not None:
+            async with self.marketplace_lock(payload.message_id):
+                transitioned = self.db.transition_marketplace_listing(
+                    payload.message_id,
+                    expected_statuses={"active", "open", "claimed", "pending"},
+                    new_status="removed",
+                    resolution_reason="Primary listing message deleted",
+                )
+                if not transitioned:
+                    self.active_listings.pop(payload.message_id, None)
+                    return
+                listing["status"] = "removed"
+                self.active_listings.pop(payload.message_id, None)
+            await self.delete_listing_messages(listing)
+            if listing.get("deal_thread_id"):
+                await self.close_deal_thread_action_messages(
+                    listing,
+                    content="This deal was closed because its listing message was deleted.",
+                )
+                await self.delete_deal_thread(
+                    listing,
+                    reason="Marketplace listing message deleted",
+                )
+            log_marketplace_event(
+                self.db,
+                "listing_removed_message_deleted",
+                user_id=listing.get("seller_id"),
+                listing_id=payload.message_id,
             )
+            return
+
+        for candidate in self.active_listings.values():
+            if int(candidate.get("surface_message_id") or 0) != int(payload.message_id):
+                continue
+            candidate["surface_message_id"] = None
+            candidate["surface_channel_id"] = None
+            status = str(candidate.get("status", "active")).lower()
+            if status in {"claimed", "pending"}:
+                view_cls = ClaimedListingView
+            elif candidate.get("listing_type") == "auction":
+                view_cls = AuctionActionView
+            else:
+                view_cls = ListingActionView
+            if self.listing_surface_should_exist(candidate):
+                await self.surface_listing_message(
+                    candidate,
+                    view=view_cls(self, self.db, candidate),
+                )
+            self.db.upsert_marketplace_listing(candidate)
+            log_marketplace_event(
+                self.db,
+                "listing_surface_message_repaired" if candidate.get("surface_message_id") else "listing_surface_message_deleted",
+                user_id=candidate.get("seller_id"),
+                listing_id=candidate.get("message_id"),
+                details={"deleted_message_id": payload.message_id},
+            )
+            break
 
     async def hydrate_user(self, user_id: int, fallback_name: str = None, *, fetch: bool = True):
         """Return a Discord user when needed, falling back to persisted user data.
@@ -388,7 +658,7 @@ class NBACollectBot(discord.Client):
             return
 
         self.notify_rules = self.db.get_active_notify_rules()
-        stale_auctions_removed = await self.cleanup_stale_auctions_on_startup()
+        ended_auctions_restored = await self.log_ended_auctions_on_startup()
         restored_listings = 0
         repaired_listings = 0
         deferred_visible_repairs = 0
@@ -578,14 +848,15 @@ class NBACollectBot(discord.Client):
             elif listing.get("deal_thread_id"):
                 await self.close_deal_thread_action_messages(listing)
             if (
-                restore_visible_messages
-                and listing.get("listing_type") == "auction"
-                and status == "active"
+                status in {"active", "claimed", "pending"}
             ):
                 await self.edit_listing_messages(
                     listing,
-                    embed=build_listing_embed(listing),
-                    view=AuctionActionView(self, self.db, listing),
+                    embed=build_listing_embed(
+                        listing,
+                        claimed=status in {"claimed", "pending"},
+                    ),
+                    view=view_cls(self, self.db, listing),
                 )
             for bid in listing.get("bids", []):
                 bidder = await self.hydrate_user(
@@ -624,11 +895,12 @@ class NBACollectBot(discord.Client):
 
         self._marketplace_state_restored = True
         LOGGER.info(
-            "Restored %s marketplace listing(s), repaired %s, deferred %s visible repair(s), removed %s stale listing(s), and restored %s notify rule(s).",
+            "Restored %s marketplace listing(s), repaired %s, deferred %s visible repair(s), removed %s stale listing(s), preserved %s ended auction(s), and restored %s notify rule(s).",
             restored_listings,
             repaired_listings,
             deferred_visible_repairs,
-            removed_listings + stale_auctions_removed,
+            removed_listings,
+            ended_auctions_restored,
             len(self.notify_rules),
         )
 
@@ -643,8 +915,8 @@ class NBACollectBot(discord.Client):
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
 
-    async def cleanup_stale_auctions_on_startup(self) -> int:
-        """Leave ended auctions restorable so sellers can finalize them."""
+    async def log_ended_auctions_on_startup(self) -> int:
+        """Record ended auctions that remain available for seller finalization."""
         now = datetime.now(timezone.utc)
         try:
             rows = self.db.conn.execute(
@@ -658,15 +930,17 @@ class NBACollectBot(discord.Client):
                 ("auction",),
             ).fetchall()
         except Exception:
-            LOGGER.exception("Could not query stale auctions during startup")
+            LOGGER.exception("Could not query ended auctions during startup")
             return 0
 
-        removed_count = 0
+        ended_count = 0
         for row in rows:
             listing = dict(row)
             end_at = self._parse_datetime(listing.get("auction_end_at"))
             if end_at is None or end_at > now:
                 continue
+
+            ended_count += 1
 
             log_marketplace_event(
                 self.db,
@@ -680,7 +954,7 @@ class NBACollectBot(discord.Client):
                 },
             )
 
-        return removed_count
+        return ended_count
 
     async def safe_dm_user(self, user: discord.abc.User, *, content: str = None, embed: discord.Embed = None, view: ui.View = None) -> bool:
         """Send a DM and return whether it succeeded."""
@@ -704,6 +978,16 @@ class NBACollectBot(discord.Client):
                 "dm_failed",
                 user_id=getattr(user, "id", None),
                 details={"username": getattr(user, "name", str(user))},
+                level=30,
+            )
+            return False
+        except discord.DiscordException as exc:
+            LOGGER.warning("Could not DM user %s: %s", getattr(user, "name", user), exc)
+            log_marketplace_event(
+                self.db,
+                "dm_failed",
+                user_id=getattr(user, "id", None),
+                details={"username": getattr(user, "name", str(user)), "reason": type(exc).__name__},
                 level=30,
             )
             return False
@@ -1134,10 +1418,12 @@ class NBACollectBot(discord.Client):
             )
             return None
 
+        failed_members = []
         for user in (seller, buyer):
             try:
                 await thread.add_user(user)
             except discord.DiscordException as exc:
+                failed_members.append(user)
                 LOGGER.warning("Could not add user %s to deal thread %s: %s", getattr(user, "id", user), thread.id, exc)
                 log_marketplace_event(
                     self.db,
@@ -1146,6 +1432,17 @@ class NBACollectBot(discord.Client):
                     listing_id=listing_data.get("message_id"),
                     details={"thread_id": thread.id, "reason": type(exc).__name__},
                     level=30,
+                )
+
+        if failed_members:
+            for user in failed_members:
+                await self.safe_dm_listing(
+                    user,
+                    listing_data,
+                    content=(
+                        "A private deal thread was created, but I could not add you to it. "
+                        f"Contact the other participant directly: {_mention_user(buyer if user is seller else seller)}"
+                    ),
                 )
 
         try:
@@ -1675,6 +1972,11 @@ def main():
         sheet=sheet,
         db=db,
         sale_channel_id=config.get("discord_sale_channel_id"),
+        auction_channel_id=(
+            config.get("discord_auction_channel_id")
+            or config.get("discord_auction_surface_channel_id")
+            or config.get("discord_sale_channel_id")
+        ),
         listing_surface_channel_id=config.get("discord_listing_surface_channel_id"),
         auction_surface_channel_id=config.get("discord_auction_surface_channel_id"),
         config=config,
@@ -1686,8 +1988,11 @@ def main():
     @bot.event
     async def on_ready():
         await bot.restore_marketplace_state()
+        await bot.reconcile_absent_seller_listings()
+        await bot.remove_legacy_slash_commands()
         await bot.ensure_nba_bot_interfaces()
         bot.start_claim_reminder_loop()
+        bot.start_seller_reconciliation_loop()
         LOGGER.info("Discord bot is ready.")
 
     bot.run(config["discord_token"])

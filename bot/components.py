@@ -15,6 +15,7 @@ ANY_VALUE = "ANY"
 UNLIMITED_VALUE = 999
 NO_SETS_VALUE = "__no_sets__"
 NO_SUBSETS_VALUE = "__no_subsets__"
+EMPTY_VARIANT_VALUE = "__empty_variant__"
 
 PlayerNameCallback = Callable[[discord.Interaction, str | None], Awaitable[None]]
 PlayerNameNormalizer = Callable[[str | None], str | None]
@@ -236,6 +237,18 @@ def _placeholder_option(label: str, value: str) -> discord.SelectOption:
     return discord.SelectOption(label=label[:100], value=value[:100], default=True)
 
 
+def decode_variant_value(value: str) -> str:
+    return "" if value == EMPTY_VARIANT_VALUE else value
+
+
+def _variant_option_label(variant: str) -> str:
+    return "No Prefix" if variant == "" else variant
+
+
+def _variant_option_value(variant: str) -> str:
+    return EMPTY_VARIANT_VALUE if variant == "" else variant
+
+
 def build_set_options(self):
     options = []
     if getattr(self, "set_optional", False) and _include_any_options(self):
@@ -329,8 +342,8 @@ def build_variant_options(self):
 
     return [
         discord.SelectOption(
-            label=variant[:100],
-            value=variant[:100],
+            label=_variant_option_label(variant)[:100],
+            value=_variant_option_value(variant)[:100],
             default=variant == getattr(self, "subset_variant_value", None),
         )
         for variant in variants
@@ -446,7 +459,7 @@ async def on_subset_select(self, interaction: discord.Interaction):
 
 
 async def on_variant_select(self, interaction: discord.Interaction):
-    self.subset_variant_value = self.variant_select.values[0]
+    self.subset_variant_value = decode_variant_value(self.variant_select.values[0])
     self.subset_value = format_subset_for_set(
         self.set_value,
         self.subset_group_value,

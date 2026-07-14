@@ -21,27 +21,36 @@ Slash commands are deprecated. User actions are expected to start from the persi
 - **Marketplace listings**
   - Fixed-price listing flow with image upload.
   - Auction listing flow with starting price, duration, and bid increment.
+  - Marketplace browsing supports player paging, price filters, fixed-price/auction filters, ending-soon auctions, refresh, and close controls.
   - OCR-assisted metadata extraction from uploaded card images.
   - Set/subset/variant/card-count review before publish.
-  - Listing embeds include seller info, card metadata, price, and image.
+  - Listing embeds include seller info, card metadata, price, image, accepted payment platform names, and a localized posted timestamp.
+
+- **Marketplace profiles**
+  - The private `My Profile` panel stores each user's Topps Collect IGN, payment account usernames, and public payment notes.
+  - New sellers need an IGN and at least one `Platform: username` payment account.
+  - Buyers need an IGN before claiming, offering, or bidding.
+  - Public listings show platform names and payment notes; payment usernames are shared privately with the buyer after a claim.
 
 - **Claims, offers, auctions, and transactions**
   - Buyers can claim fixed-price listings or make offers.
   - Sellers can accept, counter, or decline offers.
   - Auctions support bids, bid increments, auction end time, and seller finalization.
-  - Completed marketplace deals can be recorded as transactions.
-  - Claimed listings have follow-up controls and stale-claim reminder handling.
+  - Claimed deals follow an explicit claim → buyer paid → seller transferred/completed lifecycle.
+  - Buyers, sellers, and moderators have safe void/dispute paths; auction wins can be voided without reopening the auction.
+  - Claimed listings have follow-up controls, stale-claim reminders, and moderator escalation.
 
 - **Notifications**
   - Users can create and remove alert rules.
   - Rules can match player, set, subset/variant, and card count.
-  - Matching users are DM'd when a new listing is published.
+  - Matching users receive one DM per listing, even when several rules match, with a direct listing link when available.
 
 - **Persistence and recovery**
-  - SQLite stores sales, marketplace listings, bids, notification rules, events, seller payment methods, and bot metadata.
+  - SQLite stores sales, marketplace listings, bids, notification rules, events, marketplace profiles, and bot metadata.
   - Startup restores active listings and persistent views from the database.
   - Listing images can be persisted as blobs to repair Discord CDN/attachment edge cases.
   - Optional surface channels can mirror listings and auctions outside the primary sale channel.
+  - Failed Google Sheets transaction writes are queued locally and retried on startup.
 
 ## Architecture
 
@@ -88,6 +97,7 @@ DISCORD_BOT_CHANNEL_ID=
 DISCORD_BOT_CHANNEL_NAME=nba-bot
 DISCORD_SALE_CHANNEL_ID=
 DISCORD_LISTING_SURFACE_CHANNEL_ID=
+DISCORD_AUCTION_CHANNEL_ID=
 DISCORD_AUCTION_SURFACE_CHANNEL_ID=
 DISCORD_MOD_CHANNEL_ID=
 
@@ -102,6 +112,8 @@ WEB_HOST=127.0.0.1
 WEB_PORT=8000
 ```
 
+`DISCORD_AUCTION_CHANNEL_ID` is the primary channel where auction messages are created. `DISCORD_AUCTION_SURFACE_CHANNEL_ID` is only an optional mirror; when the primary auction channel is omitted, the bot falls back to the legacy surface value and then the sale channel.
+
 ## Data Storage
 
 SQLite is the operational store. `CardDatabase` owns schema creation and lightweight migrations.
@@ -113,9 +125,11 @@ Important tables:
 - `marketplace_bids` for offers, bids, counters, and bid state.
 - `notify_rules` for user alert filters.
 - `marketplace_events` for audit/debug telemetry.
+- `pending_sheet_sales` for durable Google Sheets retry work.
 - metadata tables for bot message IDs and persistent interface state.
 
 Google Sheets can be used as an upstream source for pricing and transaction history. When enabled, the bot syncs sheet rows into the local database on startup.
+For exact retry deduplication, include a `Source Listing ID` (or `Listing ID`) column in the Sheet; the bot also supports both `Card Count` and the legacy `Limited Edition or Unlimited` header.
 
 ## Discord UI Notes
 

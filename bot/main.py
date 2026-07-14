@@ -26,6 +26,10 @@ def _env_config() -> dict:
         "app_id": os.getenv("DISCORD_APP_ID", ""),
         "public_key": os.getenv("DISCORD_PUBLIC_KEY", ""),
         "discord_sale_channel_id": os.getenv("DISCORD_SALE_CHANNEL_ID", ""),
+        "discord_auction_channel_id": (
+            os.getenv("DISCORD_AUCTION_CHANNEL_ID", "")
+            or os.getenv("DISCORD_AUCTION_SURFACE_CHANNEL_ID", "")
+        ),
         "discord_listing_surface_channel_id": os.getenv("DISCORD_LISTING_SURFACE_CHANNEL_ID", ""),
         "discord_auction_surface_channel_id": os.getenv("DISCORD_AUCTION_SURFACE_CHANNEL_ID", ""),
         "discord_bot_channel_id": os.getenv("DISCORD_BOT_CHANNEL_ID", ""),
@@ -81,6 +85,9 @@ def sync_sheet_to_db(sheet: PriceSheet) -> None:
         LOGGER.info("Google Sheets integration is disabled. Skipping sync.")
         return
     try:
+        retried = sheet.retry_pending_sheet_sales()
+        if retried:
+            LOGGER.info("Retried %s pending Google Sheets sale(s).", retried)
         LOGGER.info("Syncing Google Sheets to database...")
         LOGGER.info(f"{sheet.sync_sheets_to_db()} records synced.")
         LOGGER.info("Sync complete.")

@@ -5,6 +5,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 from database import CardDatabase
+from logger import LOGGER
+
 
 class PriceSheet:
     """Integration between Google Sheets and local SQLite database."""
@@ -81,9 +83,42 @@ class PriceSheet:
         """Get all sales from the database."""
         return self.db.get_all_sales()
 
-    def query_player(self, player_name: Optional[str] = None, set_name: Optional[str] = None, cc: Optional[int] = None, subset: Optional[str] = None) -> List[Dict[str, Any]]:
+    def query_player(self, player_name: Optional[str] = None, set_name: Optional[str] = None, cc: Optional[int] = None, subset: Optional[str] = None, card_rarity: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         """Query player sales from the database."""
-        return self.db.query_player(player_name, set_name, cc, subset)
+        return self.db.query_player(player_name, set_name, cc, subset, limit=limit, card_rarity=card_rarity)
+
+    def _insert_sale_row(self, payload: Dict[str, Any]) -> None:
+        values = self.sheet.get_all_values()
+        header_index = self._find_header_row(values)
+        if header_index is None:
+            raise ValueError("Could not find the Google Sheet header row.")
+        headers = [str(header).strip() for header in values[header_index]]
+        source_listing_id = payload.get("source_listing_id")
+        source_header = next(
+            (name for name in ("Source Listing ID", "Listing ID") if name in headers),
+            None,
+        )
+        if source_listing_id is not None and source_header:
+            source_index = headers.index(source_header)
+            for row in values[header_index + 1:]:
+                if source_index < len(row) and str(row[source_index]).strip() == str(source_listing_id):
+                    return
+        aliases = {
+            "Player Name(s)": payload.get("player_names", ""),
+            "Set": payload.get("set_name", ""),
+            "Rarity": payload.get("card_rarity") or "",
+            "Subset": payload.get("subset", ""),
+            "Limited Edition or Unlimited": payload.get("card_count_value", ""),
+            "Card Count": payload.get("card_count_value", ""),
+            "Price": payload.get("price", ""),
+            "Date + Time": payload.get("date_time", ""),
+            "Source": "Discord Marketplace",
+            "Sale Type": "Discord Marketplace",
+            "Source Listing ID": str(source_listing_id or ""),
+            "Listing ID": str(source_listing_id or ""),
+        }
+        row = [aliases.get(header, "") for header in headers]
+        self.sheet.insert_row(row, index=header_index + 2)
 
     def add_sale(
         self,
@@ -96,10 +131,11 @@ class PriceSheet:
         seller_id: int = None,
         image_url: str = None,
         card_rarity: str = "Legendary",
+        source_listing_id: int = None,
     ):
         """Add a sale to both the database and Google Sheets."""
         # Add to database
-        self.db.add_sale(
+        sale_id = self.db.add_sale(
             player_names=player_names,
             set_name=set_name,
             subset=subset,
@@ -108,6 +144,8 @@ class PriceSheet:
             card_count=card_count,
             seller_id=seller_id,
             image_url=image_url,
+            card_rarity=card_rarity,
+            source_listing_id=source_listing_id,
         )
 
         # Add to Google Sheets as backup
@@ -117,18 +155,40 @@ class PriceSheet:
             normalized_card_count = 999 if str(card_count).upper() == "ANY" else 1
         card_count_value = "Unlimited" if normalized_card_count >= 999 else str(normalized_card_count)
 
-        row = [
-            player_names,
-            set_name,
-            card_rarity or "Legendary",
-            subset,
-            card_count_value,
-            price,
-            date_time,
-            "Discord Buy it Now",
-        ]
+        payload = {
+            "player_names": player_names,
+            "set_name": set_name,
+            "card_rarity": card_rarity,
+            "subset": subset,
+            "card_count_value": card_count_value,
+            "price": price,
+            "date_time": date_time,
+            "seller_id": seller_id,
+            "image_url": image_url,
+            "source_listing_id": source_listing_id,
+        }
 
         try:
-            self.sheet.insert_row(row, index=2)
+            self._insert_sale_row(payload)
+            if source_listing_id is not None:
+                self.db.complete_pending_sheet_sale(source_listing_id)
+            return {"sale_id": sale_id, "sheet_synced": True}
         except Exception as e:
-            print(f"Warning: Could not append to Google Sheets: {e}")
+            LOGGER.warning("Could not append marketplace sale to Google Sheets: %s", e)
+            if source_listing_id is not None:
+                self.db.enqueue_pending_sheet_sale(source_listing_id, payload, str(e))
+            return {"sale_id": sale_id, "sheet_synced": False, "error": str(e)}
+
+    def retry_pending_sheet_sales(self) -> int:
+        completed = 0
+        for pending in self.db.get_pending_sheet_sales():
+            try:
+                self._insert_sale_row(pending.get("payload") or {})
+            except Exception as exc:
+                self.db.enqueue_pending_sheet_sale(
+                    pending["listing_id"], pending.get("payload") or {}, str(exc)
+                )
+                continue
+            self.db.complete_pending_sheet_sale(pending["listing_id"])
+            completed += 1
+        return completed
