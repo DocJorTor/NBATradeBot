@@ -20,14 +20,18 @@ Slash commands are deprecated. User actions are expected to start from the persi
 
 - **Marketplace listings**
   - Fixed-price listing flow with image upload.
+  - Complete and incomplete set listings read set, subset, rarity, and owned/total progress from collection screenshots.
+  - Set listings track award inclusion and an optional missing-card list without using individual-card Price Assist.
   - Auction listing flow with starting price, duration, and bid increment.
   - Marketplace browsing supports player paging, price filters, fixed-price/auction filters, ending-soon auctions, refresh, and close controls.
+  - Marketplace opens on Discord listings and exposes a visible ChaseFiends switch with the available external count.
+  - A bundled, read-only ChaseFiends snapshot adds clearly attributed external listings with direct-site and information actions.
   - OCR-assisted metadata extraction from uploaded card images.
   - Set/subset/variant/card-count review before publish.
   - Listing embeds include seller info, card metadata, price, image, accepted payment platform names, and a localized posted timestamp.
 
 - **Marketplace profiles**
-  - The private `My Profile` panel stores each user's Topps Collect IGN, payment account usernames, and public payment notes.
+  - The private `Account` panel stores each user's Topps Collect IGN, payment account usernames, and public payment notes.
   - New sellers need an IGN and at least one `Platform: username` payment account.
   - Buyers need an IGN before claiming, offering, or bidding.
   - Public listings show platform names and payment notes; payment usernames are shared privately with the buyer after a claim.
@@ -62,6 +66,7 @@ bot/
   components.py     Shared set/subset/variant/card-count dropdown builders and fallback search modals.
   actions.py        Listing image collection, listing publication, notification fanout.
   database.py       SQLite schema, migrations, marketplace persistence, notify rules, event logging.
+  marketplace.py    Provider-neutral listing domain, adapters, validation, and static external snapshot loading.
   price_assist.py   Price query helpers and paginated price result views.
   ocr.py            Image preprocessing and OCR metadata extraction.
   serializers.py    Discord embed builders and display formatting.
@@ -104,6 +109,8 @@ DISCORD_MOD_CHANNEL_ID=
 DATABASE_PATH=cards.db
 DISABLE_SHEETS=false
 RESTORE_VISIBLE_LISTING_MESSAGES_ON_STARTUP=false
+ENABLE_CHASEFIENDS_SNAPSHOT=true
+CHASEFIENDS_SNAPSHOT_PATH=
 
 GOOGLE_SHEETS_SPREADSHEET_ID=
 GOOGLE_SHEETS_CREDENTIALS_FILE=bot/service_account.json
@@ -130,6 +137,13 @@ Important tables:
 
 Google Sheets can be used as an upstream source for pricing and transaction history. When enabled, the bot syncs sheet rows into the local database on startup.
 For exact retry deduplication, include a `Source Listing ID` (or `Listing ID`) column in the Sheet; the bot also supports both `Card Count` and the legacy `Limited Edition or Unlimited` header.
+Set sales always populate the existing `Set`, `Subset`, and `Rarity` columns. To retain all set-specific analytics in Sheets, add these optional headers: `Listing Kind`, `Set Cards Owned`, `Set Cards Total`, `Includes Award`, and `Missing Cards`.
+
+## ChaseFiends Demo Snapshot
+
+The initial ChaseFiends integration is intentionally static. On startup, the bot reads `bot/data/chasefiends_nba_listings.jsonl`; it does not call ChaseFiends, run a partner sync task, or import external sales history. Set `ENABLE_CHASEFIENDS_SNAPSHOT=false` to disable the integration immediately. `CHASEFIENDS_SNAPSHOT_PATH` can point to a replacement local snapshot.
+
+External listings remain separate from Discord-owned listings, cannot be claimed or managed in Discord, and are ignored by Discord seller membership reconciliation. Marketplace browsing defaults to Discord inventory and provides a visible source-switch button; the external action panel contains only `Go to Site` and `Listing Info`.
 
 ## Discord UI Notes
 

@@ -2,6 +2,8 @@ import discord
 from typing import Any, Dict
 from datetime import datetime, timezone
 
+from marketplace import CHASEFIENDS_DISPLAY_NAME, is_external_listing, is_set_listing
+
 
 def format_card_count(card_count) -> str:
     if card_count in (None, "", "Any", "ANY"):
@@ -119,6 +121,111 @@ def highest_active_bid(listing_data: Dict[str, Any]) -> Dict[str, Any] | None:
     return max(bids, key=lambda bid: float(bid.get("amount") or bid.get("bid_amount") or 0))
 
 
+def _external_price_text(listing_data: Dict[str, Any]) -> str:
+    price = float(listing_data.get("price") or 0)
+    currency = str(listing_data.get("currency") or "USD").upper()
+    return f"${price:,.2f}" if currency == "USD" else f"{price:,.2f} {currency}"
+
+
+def build_external_listing_embed(listing_data: Dict[str, Any]) -> discord.Embed:
+    """Build a clearly attributed external listing in the native sale style."""
+    raw_card_count = listing_data.get("card_count")
+    card_count_text = (
+        "Not provided"
+        if raw_card_count in (None, "", "Any", "ANY")
+        else f"/{format_card_count(raw_card_count)}"
+    )
+    details = [
+        f"Subset: {listing_data.get('subset') or 'Not provided'}",
+        f"Card Count: {card_count_text}",
+        f"Listing Price: {_external_price_text(listing_data)}",
+    ]
+    listing_time = _listing_time_text(listing_data)
+    if listing_time:
+        details.append(listing_time)
+
+    source_url = listing_data.get("source_url")
+    embed = discord.Embed(
+        title=(
+            f"🌐 {listing_data.get('player_names') or 'External Listing'} - "
+            f"{listing_data.get('set_name') or 'Unknown set'}"
+        )[:256],
+        url=source_url,
+        description="\n".join(details),
+        color=discord.Color.blue(),
+    )
+    image_url = _listing_image_url(listing_data)
+    if image_url:
+        embed.set_image(url=image_url)
+    seller_name = str(listing_data.get("seller_name") or "ChaseFiends seller")
+    embed.set_footer(
+        text=(
+            f"Listed on {CHASEFIENDS_DISPLAY_NAME} by {seller_name} | "
+            "External listing — all activity occurs on ChaseFiends"
+        )
+    )
+    return embed
+
+
+def build_set_listing_embed(
+    listing_data: Dict[str, Any],
+    *,
+    sold: bool = False,
+    claimed: bool = False,
+) -> discord.Embed:
+    """Build a fixed-price listing for a complete or partial collection set."""
+    status = str(listing_data.get("status", "")).lower()
+    removed = status in {"removed", "voided", "cancelled"}
+    title_prefix = "REMOVED - " if removed else "SOLD - " if sold else "CLAIMED - " if claimed else ""
+    cards_owned = int(listing_data.get("set_cards_owned") or 0)
+    cards_total = int(listing_data.get("set_cards_total") or 0)
+    complete = cards_total > 0 and cards_owned >= cards_total
+    details = [
+        f"Subset: {listing_data.get('subset') or 'Not provided'}",
+        f"Rarity: {listing_data.get('card_rarity') or 'Not provided'}",
+        f"Set Progress: {cards_owned}/{cards_total} cards",
+        f"Status: {'Complete' if complete else 'Incomplete'}",
+        f"Includes Award: {'Yes' if listing_data.get('includes_award') else 'No'}",
+    ]
+    missing_cards = str(listing_data.get("missing_cards") or "").strip()
+    if not complete and missing_cards:
+        details.append(f"Missing Cards: {missing_cards}")
+    details.append(f"Listing Price: ${float(listing_data.get('price') or 0):.2f}")
+    listing_time = _listing_time_text(listing_data)
+    if listing_time:
+        details.append(listing_time)
+
+    set_name = str(listing_data.get("set_name") or listing_data.get("player_names") or "Unknown Set")
+    embed = discord.Embed(
+        title=f"{title_prefix}{set_name} - Set"[:256],
+        description="\n".join(details),
+        color=(
+            discord.Color.dark_grey()
+            if removed
+            else discord.Color.red()
+            if sold
+            else discord.Color.yellow()
+            if claimed
+            else discord.Color.blue()
+        ),
+    )
+    image_url = _listing_image_url(listing_data)
+    if image_url:
+        embed.set_image(url=image_url)
+
+    footer = f"Listed by {_seller_display_name(listing_data)}"
+    payment_platforms = _public_payment_platforms(listing_data.get("payment_methods"))
+    payment_notes = str(listing_data.get("payment_notes") or "").strip()
+    if payment_platforms or payment_notes:
+        footer = f"{footer} | Payment Platforms: {payment_platforms or 'Not provided'}"
+    if payment_notes:
+        footer = f"{footer} | Payment Notes: {payment_notes}"
+    if removed:
+        footer = f"{footer} | Removed/archived"
+    embed.set_footer(text=footer)
+    return embed
+
+
 def build_listing_embed(
     listing_data: Dict[str, Any],
     *,
@@ -126,6 +233,11 @@ def build_listing_embed(
     claimed: bool = False,
 ) -> discord.Embed:
     """Build the public sale listing embed."""
+    if is_external_listing(listing_data):
+        return build_external_listing_embed(listing_data)
+    if is_set_listing(listing_data):
+        return build_set_listing_embed(listing_data, sold=sold, claimed=claimed)
+
     status = str(listing_data.get("status", "")).lower()
     removed = status in {"removed", "voided", "cancelled"}
     is_auction = str(listing_data.get("listing_type", "sale")).lower() == "auction"

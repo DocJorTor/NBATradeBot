@@ -11,6 +11,7 @@ from commands import register_bot_interface
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
 from main import load_config, create_price_sheet, sync_sheet_to_db
+from marketplace import load_chasefiends_snapshot
 from serializers import build_listing_embed
 from sheets import PriceSheet
 from views import (
@@ -137,6 +138,18 @@ class NBACollectBot(discord.Client):
         self.auction_surface_channel_id = auction_surface_channel_id
         self.config = config or {}
         self.active_listings: Dict[int, Dict[str, Any]] = {}
+        self.external_listings: list[Dict[str, Any]] = []
+        if self.config.get("enable_chasefiends_snapshot", True):
+            try:
+                self.external_listings = load_chasefiends_snapshot(
+                    self.config.get("chasefiends_snapshot_path")
+                )
+            except (OSError, ValueError):
+                LOGGER.exception("Could not load the local ChaseFiends listing snapshot")
+        LOGGER.info(
+            "Loaded %s static ChaseFiends marketplace listing(s).",
+            len(self.external_listings),
+        )
         self.notify_rules = []
         self._hydrated_users: Dict[int, discord.abc.User] = {}
         self._marketplace_state_restored = False
@@ -186,7 +199,8 @@ class NBACollectBot(discord.Client):
         listings = [
             listing
             for listing in list(self.active_listings.values())
-            if int(listing.get("seller_id") or 0) == int(seller_id)
+            if listing.get("source", "discord") == "discord"
+            and int(listing.get("seller_id") or 0) == int(seller_id)
             and (
                 int(listing.get("guild_id") or 0) == int(guild_id)
                 or (not listing.get("guild_id") and len(self.guilds) == 1)
@@ -246,6 +260,8 @@ class NBACollectBot(discord.Client):
         """Remove listings whose sellers are no longer members of their guild."""
         seller_guild_pairs = set()
         for listing in self.active_listings.values():
+            if listing.get("source", "discord") != "discord":
+                continue
             seller_id = listing.get("seller_id")
             guild_id = listing.get("guild_id")
             if not guild_id and len(self.guilds) == 1:
@@ -1563,7 +1579,6 @@ class NBACollectBot(discord.Client):
 
     async def ensure_listing_image_url(self, listing_data: Dict[str, Any]) -> str | None:
         """Resolve attachment placeholders into reusable Discord CDN URLs."""
-        image_bytes = await self.ensure_listing_image_asset(listing_data)
         image_url = listing_data.get("image_url")
         surface_image_url = listing_data.get("surface_image_url")
         if image_url and not str(image_url).startswith("attachment://"):
@@ -1571,6 +1586,7 @@ class NBACollectBot(discord.Client):
         if surface_image_url and not str(surface_image_url).startswith("attachment://"):
             listing_data["image_url"] = surface_image_url
             return surface_image_url
+        image_bytes = await self.ensure_listing_image_asset(listing_data)
         if image_bytes is not None:
             return f"attachment://{self.listing_image_filename(listing_data)}"
 

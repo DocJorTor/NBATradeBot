@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 class CardDatabase:
     """SQLite database for managing card sales and pricing data."""
 
-    SCHEMA_VERSION = 13
+    SCHEMA_VERSION = 14
 
     def __init__(self, db_path: str | Path = "cards.db"):
         self.db_path = Path(db_path)
@@ -54,6 +54,11 @@ class CardDatabase:
         """)
         self._ensure_column("card_sales", "card_rarity", "TEXT")
         self._ensure_column("card_sales", "source_listing_id", "INTEGER")
+        self._ensure_column("card_sales", "listing_kind", "TEXT DEFAULT 'player'")
+        self._ensure_column("card_sales", "set_cards_owned", "INTEGER")
+        self._ensure_column("card_sales", "set_cards_total", "INTEGER")
+        self._ensure_column("card_sales", "includes_award", "INTEGER DEFAULT 0")
+        self._ensure_column("card_sales", "missing_cards", "TEXT")
         cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_card_sales_source_listing
             ON card_sales(source_listing_id)
@@ -132,6 +137,11 @@ class CardDatabase:
         self._ensure_column("marketplace_listings", "claimed_at", "TEXT")
         self._ensure_column("marketplace_listings", "resolution_reason", "TEXT")
         self._ensure_column("marketplace_listings", "deal_status", "TEXT")
+        self._ensure_column("marketplace_listings", "listing_kind", "TEXT DEFAULT 'player'")
+        self._ensure_column("marketplace_listings", "set_cards_owned", "INTEGER")
+        self._ensure_column("marketplace_listings", "set_cards_total", "INTEGER")
+        self._ensure_column("marketplace_listings", "includes_award", "INTEGER DEFAULT 0")
+        self._ensure_column("marketplace_listings", "missing_cards", "TEXT")
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_marketplace_listings_status
             ON marketplace_listings(status)
@@ -295,10 +305,11 @@ class CardDatabase:
                 surface_image_url, image_blob, image_filename, image_content_type,
                 listing_type, auction_end_at, bid_increment, starting_price, claim_price,
                 claimed_at, resolution_reason, deal_status,
+                listing_kind, set_cards_owned, set_cards_total, includes_award, missing_cards,
                 deal_thread_id, deal_thread_parent_channel_id,
                 deal_thread_action_channel_id, deal_thread_action_message_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(message_id) DO UPDATE SET
                 channel_id = excluded.channel_id,
                 guild_id = excluded.guild_id,
@@ -330,6 +341,11 @@ class CardDatabase:
                 claimed_at = excluded.claimed_at,
                 resolution_reason = excluded.resolution_reason,
                 deal_status = excluded.deal_status,
+                listing_kind = excluded.listing_kind,
+                set_cards_owned = excluded.set_cards_owned,
+                set_cards_total = excluded.set_cards_total,
+                includes_award = excluded.includes_award,
+                missing_cards = excluded.missing_cards,
                 deal_thread_id = COALESCE(excluded.deal_thread_id, marketplace_listings.deal_thread_id),
                 deal_thread_parent_channel_id = COALESCE(excluded.deal_thread_parent_channel_id, marketplace_listings.deal_thread_parent_channel_id),
                 deal_thread_action_channel_id = COALESCE(excluded.deal_thread_action_channel_id, marketplace_listings.deal_thread_action_channel_id),
@@ -368,6 +384,11 @@ class CardDatabase:
                 listing_data.get("claimed_at"),
                 listing_data.get("resolution_reason"),
                 listing_data.get("deal_status"),
+                listing_data.get("listing_kind", "player"),
+                listing_data.get("set_cards_owned"),
+                listing_data.get("set_cards_total"),
+                int(bool(listing_data.get("includes_award"))),
+                listing_data.get("missing_cards"),
                 listing_data.get("deal_thread_id"),
                 listing_data.get("deal_thread_parent_channel_id"),
                 listing_data.get("deal_thread_action_channel_id"),
@@ -758,6 +779,8 @@ class CardDatabase:
             listing["payment_notes"] = profile.get("payment_notes")
             listing["image_bytes"] = listing.get("image_blob")
             listing["card_count"] = self._coerce_card_count(listing.get("card_count"))
+            listing["listing_kind"] = listing.get("listing_kind") or "player"
+            listing["includes_award"] = bool(listing.get("includes_award"))
             bid_rows = self.conn.execute(
                 """
                 SELECT * FROM marketplace_bids
@@ -840,6 +863,11 @@ class CardDatabase:
         image_url: str = None,
         card_rarity: str = None,
         source_listing_id: int = None,
+        listing_kind: str = "player",
+        set_cards_owned: int = None,
+        set_cards_total: int = None,
+        includes_award: bool = False,
+        missing_cards: str = None,
     ) -> int:
         """Add a new card sale record."""
         cursor = self.conn.cursor()
@@ -850,8 +878,10 @@ class CardDatabase:
             INSERT OR IGNORE INTO card_sales (
                 player_names, set_name, subset,
                 date_time, price, card_count, seller_id,
-                image_url, card_rarity, source_listing_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                image_url, card_rarity, source_listing_id,
+                listing_kind, set_cards_owned, set_cards_total, includes_award, missing_cards,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 player_names,
@@ -864,6 +894,11 @@ class CardDatabase:
                 image_url,
                 card_rarity,
                 source_listing_id,
+                listing_kind,
+                set_cards_owned,
+                set_cards_total,
+                int(bool(includes_award)),
+                missing_cards,
                 now,
                 now,
             ),
@@ -894,7 +929,7 @@ class CardDatabase:
         query = """
             SELECT *
             FROM card_sales
-            WHERE 1 = 1
+            WHERE COALESCE(listing_kind, 'player') != 'set'
         """
         params: list[Any] = []
 
@@ -1016,6 +1051,14 @@ class CardDatabase:
                 source_listing_id = int(str(source_listing_value).strip()) if source_listing_value else None
             except (TypeError, ValueError):
                 source_listing_id = None
+            listing_kind = str(row.get("Listing Kind") or "player").strip().lower()
+            try:
+                set_cards_owned = int(row.get("Set Cards Owned")) if str(row.get("Set Cards Owned") or "").strip() else None
+                set_cards_total = int(row.get("Set Cards Total")) if str(row.get("Set Cards Total") or "").strip() else None
+            except (TypeError, ValueError):
+                set_cards_owned = None
+                set_cards_total = None
+            includes_award = str(row.get("Includes Award") or "").strip().lower() in {"yes", "true", "1"}
 
             existing = None
             if source_listing_id is not None:
@@ -1041,6 +1084,11 @@ class CardDatabase:
                     card_count=card_count,
                     card_rarity=row.get("Rarity") or None,
                     source_listing_id=source_listing_id,
+                    listing_kind=listing_kind,
+                    set_cards_owned=set_cards_owned,
+                    set_cards_total=set_cards_total,
+                    includes_award=includes_award,
+                    missing_cards=row.get("Missing Cards") or None,
                 )
             elif source_listing_id is not None and existing["source_listing_id"] is None:
                 cursor.execute(

@@ -39,6 +39,8 @@ def _env_config() -> dict:
         "database_path": os.getenv("DATABASE_PATH", "cards.db"),
         "disable_sheets": _env_bool("DISABLE_SHEETS", False),
         "restore_visible_listing_messages_on_startup": _env_bool("RESTORE_VISIBLE_LISTING_MESSAGES_ON_STARTUP", False),
+        "enable_chasefiends_snapshot": _env_bool("ENABLE_CHASEFIENDS_SNAPSHOT", True),
+        "chasefiends_snapshot_path": os.getenv("CHASEFIENDS_SNAPSHOT_PATH", ""),
         "google_sheets": {
             "spreadsheet_id": os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", ""),
             "credentials_file": os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "bot/service_account.json"),

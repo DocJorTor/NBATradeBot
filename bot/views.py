@@ -22,6 +22,14 @@ from components import (
 from config import format_subset_for_set, get_subset_groups, get_subset_variants
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
+from marketplace import (
+    SOURCE_CHASEFIENDS,
+    SOURCE_DISCORD,
+    active_marketplace_inventory,
+    is_external_listing,
+    is_set_listing,
+    listing_key,
+)
 from parsers import (
     format_sheet_datetime,
     normalize_player_name,
@@ -372,6 +380,20 @@ class MarketplaceProfileView(ui.View):
 
 
 def _card_details_block(listing_data: Dict[str, Any]) -> str:
+    if is_set_listing(listing_data):
+        cards_owned = int(listing_data.get("set_cards_owned") or 0)
+        cards_total = int(listing_data.get("set_cards_total") or 0)
+        details = [
+            f"Set: {listing_data.get('set_name', 'Unknown set')}",
+            f"Subset: {listing_data.get('subset') or 'Not provided'}",
+            f"Rarity: {listing_data.get('card_rarity') or 'Not provided'}",
+            f"Set Progress: {cards_owned}/{cards_total} cards",
+            f"Includes Award: {'Yes' if listing_data.get('includes_award') else 'No'}",
+        ]
+        missing_cards = str(listing_data.get("missing_cards") or "").strip()
+        if cards_owned < cards_total and missing_cards:
+            details.append(f"Missing Cards: {missing_cards}")
+        return "\n".join(details)
     details = [
         f"Card: {listing_data.get('player_names', 'Unknown card')}",
         f"Set: {listing_data.get('set_name', 'Unknown set')}",
@@ -385,6 +407,10 @@ def _card_details_block(listing_data: Dict[str, Any]) -> str:
 
 def _claim_price(listing_data: Dict[str, Any]) -> float:
     return float(listing_data.get("claim_price") or listing_data.get("price") or 0)
+
+
+def _listing_item_word(listing_data: Dict[str, Any]) -> str:
+    return "set" if is_set_listing(listing_data) else "card"
 
 
 async def _clear_ephemeral_prompt(message, success_text: str) -> None:
@@ -479,6 +505,45 @@ async def _send_deal_thread_update(
         return False
 
 
+EXTERNAL_LISTING_INFO = (
+    "This is an external ChaseFiends listing. The NBA Bot only displays its "
+    "public listing information. Purchasing, offers, messaging, payment, card "
+    "transfer, support, and disputes all take place on ChaseFiends. Availability "
+    "may have changed since this demo snapshot was captured; open the original "
+    "listing for its current information."
+)
+
+
+class ExternalListingActionView(ui.View):
+    """Read-only actions for a listing managed outside Discord."""
+
+    def __init__(self, listing_data: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.listing_data = listing_data
+        self.add_item(ui.Button(
+            label="🌐 Go to Site",
+            style=discord.ButtonStyle.link,
+            url=listing_data["source_url"],
+            row=0,
+        ))
+
+    @ui.button(
+        label="ℹ️ Listing Info",
+        style=discord.ButtonStyle.secondary,
+        custom_id="external_listing:info",
+        row=0,
+    )
+    async def listing_info_button(
+        self,
+        interaction: discord.Interaction,
+        button: ui.Button,
+    ):
+        await interaction.response.send_message(
+            EXTERNAL_LISTING_INFO,
+            ephemeral=True,
+        )
+
+
 class MarketplaceCarouselView(ui.View):
     """Browse active marketplace listings one at a time."""
 
@@ -502,10 +567,11 @@ class MarketplaceCarouselView(ui.View):
         self.sort_mode = "newest"
         self.price_filter = ""
         self.listing_type_filter = ""
+        self.source_filter = SOURCE_DISCORD
         self.reset_to_first_on_refresh = False
         self._missing_image_logged = set()
         self.player_select = ui.Select(
-            placeholder="Filter by player",
+            placeholder="Filter by player or set",
             min_values=1,
             max_values=1,
             custom_id="marketplace:player_filter",
@@ -523,6 +589,7 @@ class MarketplaceCarouselView(ui.View):
         )
         self.price_select.callback = self.price_filter_selected
         self.add_item(self.price_select)
+        self._refresh_listings()
         self._sync_buttons()
 
     @staticmethod
@@ -532,11 +599,15 @@ class MarketplaceCarouselView(ui.View):
     def _refresh_listings(self) -> None:
         reset_to_first = self.reset_to_first_on_refresh
         self.reset_to_first_on_refresh = False
-        current_id = None if reset_to_first else self.current_listing().get("message_id") if self.listings else None
+        current_id = (
+            None
+            if reset_to_first
+            else listing_key(self.current_listing()) if self.listings else None
+        )
         search_query = self.search_query.casefold().strip()
         listings = [
             listing
-            for listing in (getattr(self.bot, "active_listings", {}) or {}).values()
+            for listing in active_marketplace_inventory(self.bot)
             if self._is_open_listing(listing)
             and (
                 not search_query
@@ -556,6 +627,11 @@ class MarketplaceCarouselView(ui.View):
                     (self.listing_type_filter == "auction" and listing.get("listing_type") == "auction")
                     or (self.listing_type_filter == "sale" and listing.get("listing_type") != "auction")
                 )
+            ]
+        if self.source_filter:
+            listings = [
+                listing for listing in listings
+                if listing.get("source", SOURCE_DISCORD) == self.source_filter
             ]
         if self.sort_mode == "price_asc":
             listings.sort(key=lambda listing: (float(listing.get("price") or 0), str(listing.get("player_names") or "").casefold()))
@@ -578,7 +654,7 @@ class MarketplaceCarouselView(ui.View):
             (
                 index
                 for index, listing in enumerate(self.listings)
-                if listing.get("message_id") == current_id
+                if listing_key(listing) == current_id
             ),
             None,
         )
@@ -588,15 +664,16 @@ class MarketplaceCarouselView(ui.View):
         seen = set()
         options = [
             discord.SelectOption(
-                label="All Players",
+                label="All Listings",
                 value="__all__",
                 default=not self.search_query,
             )
         ]
         active_listings = [
             listing
-            for listing in (getattr(self.bot, "active_listings", {}) or {}).values()
+            for listing in active_marketplace_inventory(self.bot)
             if self._is_open_listing(listing)
+            and listing.get("source", SOURCE_DISCORD) == self.source_filter
         ]
         active_listings.sort(key=lambda listing: str(listing.get("player_names") or "").casefold())
         player_names = []
@@ -630,14 +707,19 @@ class MarketplaceCarouselView(ui.View):
             ("Oldest Listings", "oldest", not self.price_filter and not self.listing_type_filter and self.sort_mode == "oldest"),
             ("Price: Low to High", "price_asc", not self.price_filter and not self.listing_type_filter and self.sort_mode == "price_asc"),
             ("Price: High to Low", "price_desc", not self.price_filter and not self.listing_type_filter and self.sort_mode == "price_desc"),
-            ("Fixed-price Listings", "type:sale", self.listing_type_filter == "sale"),
-            ("Auctions Only", "type:auction", self.listing_type_filter == "auction" and self.sort_mode != "ending"),
-            ("Auctions Ending Soon", "ending:auction", self.listing_type_filter == "auction" and self.sort_mode == "ending"),
+        ]
+        if self.source_filter == SOURCE_DISCORD:
+            options.extend([
+                ("Fixed-price Listings", "type:sale", self.listing_type_filter == "sale"),
+                ("Auctions Only", "type:auction", self.listing_type_filter == "auction" and self.sort_mode != "ending"),
+                ("Auctions Ending Soon", "ending:auction", self.listing_type_filter == "auction" and self.sort_mode == "ending"),
+            ])
+        options.extend([
             ("Under $25", "under:25", self.price_filter == "25"),
             ("Under $50", "under:50", self.price_filter == "50"),
             ("Under $100", "under:100", self.price_filter == "100"),
             ("Under $250", "under:250", self.price_filter == "250"),
-        ]
+        ])
         return [
             discord.SelectOption(label=label, value=value, default=selected)
             for label, value, selected in options
@@ -659,7 +741,8 @@ class MarketplaceCarouselView(ui.View):
             )
 
         listing_data = self.current_listing()
-        await self.bot.ensure_listing_image_url(listing_data)
+        if not is_external_listing(listing_data):
+            await self.bot.ensure_listing_image_url(listing_data)
         embed = build_listing_embed(listing_data)
         image_url = (
             listing_data.get("image_url")
@@ -671,9 +754,9 @@ class MarketplaceCarouselView(ui.View):
         if (
             log_missing_image
             and not embed.image.url
-            and listing_data.get("message_id") not in self._missing_image_logged
+            and listing_key(listing_data) not in self._missing_image_logged
         ):
-            self._missing_image_logged.add(listing_data.get("message_id"))
+            self._missing_image_logged.add(listing_key(listing_data))
             log_marketplace_event(
                 self.db,
                 "marketplace_view_missing_image",
@@ -686,23 +769,28 @@ class MarketplaceCarouselView(ui.View):
                 level=30,
             )
         footer = embed.footer.text or ""
-        position = f"Listing {self.index + 1} of {len(self.listings)}"
+        position_parts = [f"Listing {self.index + 1} of {len(self.listings)}"]
+        if self.source_filter == SOURCE_DISCORD:
+            position_parts.append("Discord")
+        elif self.source_filter == SOURCE_CHASEFIENDS:
+            position_parts.append("ChaseFiends")
         if self.search_query:
-            position = f"{position} | Search: {self.search_query}"
+            position_parts.append(f"Search: {self.search_query}")
         if self.price_filter:
-            position = f"{position} | Under ${float(self.price_filter):.0f}"
+            position_parts.append(f"Under ${float(self.price_filter):.0f}")
         elif self.listing_type_filter == "sale":
-            position = f"{position} | Fixed-price"
+            position_parts.append("Fixed-price")
         elif self.listing_type_filter == "auction" and self.sort_mode == "ending":
-            position = f"{position} | Auctions ending soon"
+            position_parts.append("Auctions ending soon")
         elif self.listing_type_filter == "auction":
-            position = f"{position} | Auctions"
+            position_parts.append("Auctions")
         elif self.sort_mode == "oldest":
-            position = f"{position} | Oldest first"
+            position_parts.append("Oldest first")
         elif self.sort_mode == "price_asc":
-            position = f"{position} | Price low-high"
+            position_parts.append("Price low-high")
         elif self.sort_mode == "price_desc":
-            position = f"{position} | Price high-low"
+            position_parts.append("Price high-low")
+        position = " | ".join(position_parts)
         embed.set_footer(text=f"{position} | {footer}" if footer else position)
         return embed
 
@@ -714,10 +802,10 @@ class MarketplaceCarouselView(ui.View):
         if (
             not getattr(kwargs["embed"].image, "url", None)
             and not kwargs.get("file")
-            and self.current_listing().get("message_id") not in self._missing_image_logged
+            and listing_key(self.current_listing()) not in self._missing_image_logged
         ):
             listing_data = self.current_listing()
-            self._missing_image_logged.add(listing_data.get("message_id"))
+            self._missing_image_logged.add(listing_key(listing_data))
             log_marketplace_event(
                 self.db,
                 "marketplace_view_missing_image",
@@ -765,6 +853,13 @@ class MarketplaceCarouselView(ui.View):
 
     def _sync_buttons(self) -> None:
         has_listings = bool(self.listings)
+        source_counts = {SOURCE_DISCORD: 0, SOURCE_CHASEFIENDS: 0}
+        for listing in active_marketplace_inventory(self.bot):
+            if not self._is_open_listing(listing):
+                continue
+            source = listing.get("source", SOURCE_DISCORD)
+            if source in source_counts:
+                source_counts[source] += 1
         self.player_select.options = self._player_filter_options()
         self.player_select.disabled = len(self.player_select.options) <= 1
         self.price_select.options = self._price_filter_options()
@@ -774,6 +869,29 @@ class MarketplaceCarouselView(ui.View):
                 child.disabled = len(self.listings) <= 1
             if custom_id == "marketplace:actions":
                 child.disabled = not has_listings
+                if has_listings and is_external_listing(self.current_listing()):
+                    child.label = "🌐 External Actions"
+                elif has_listings and is_set_listing(self.current_listing()):
+                    child.label = "📚 Set Actions"
+                else:
+                    child.label = "🃏 Card Actions"
+            if custom_id == "marketplace:source_toggle":
+                target_source = (
+                    SOURCE_CHASEFIENDS
+                    if self.source_filter == SOURCE_DISCORD
+                    else SOURCE_DISCORD
+                )
+                child.label = (
+                    f"🌐 View ChaseFiends ({source_counts[SOURCE_CHASEFIENDS]})"
+                    if target_source == SOURCE_CHASEFIENDS
+                    else f"🃏 View Discord ({source_counts[SOURCE_DISCORD]})"
+                )
+                child.style = (
+                    discord.ButtonStyle.green
+                    if target_source == SOURCE_CHASEFIENDS
+                    else discord.ButtonStyle.secondary
+                )
+                child.disabled = source_counts[target_source] == 0
             if custom_id == "marketplace:player_prev":
                 child.disabled = self.player_page <= 0
             if custom_id == "marketplace:player_next":
@@ -782,8 +900,10 @@ class MarketplaceCarouselView(ui.View):
     def _all_player_names(self) -> list[str]:
         seen = set()
         names = []
-        for listing in (getattr(self.bot, "active_listings", {}) or {}).values():
+        for listing in active_marketplace_inventory(self.bot):
             if not self._is_open_listing(listing):
+                continue
+            if listing.get("source", SOURCE_DISCORD) != self.source_filter:
                 continue
             player_name = str(listing.get("player_names") or "").strip()
             key = player_name.casefold()
@@ -895,8 +1015,14 @@ class MarketplaceCarouselView(ui.View):
             return
 
         listing_data = self.current_listing()
-        await self.bot.ensure_listing_image_url(listing_data)
-        view_cls = AuctionActionView if listing_data.get("listing_type") == "auction" else ListingActionView
+        if not is_external_listing(listing_data):
+            await self.bot.ensure_listing_image_url(listing_data)
+        if is_external_listing(listing_data):
+            action_view = ExternalListingActionView(listing_data)
+        elif listing_data.get("listing_type") == "auction":
+            action_view = AuctionActionView(self.bot, self.db, listing_data)
+        else:
+            action_view = ListingActionView(self.bot, self.db, listing_data)
         log_marketplace_event(
             self.db,
             "marketplace_view_actions_opened",
@@ -905,15 +1031,41 @@ class MarketplaceCarouselView(ui.View):
             details={
                 "player_names": listing_data.get("player_names"),
                 "listing_type": listing_data.get("listing_type", "sale"),
+                "source": listing_data.get("source", SOURCE_DISCORD),
+                "source_listing_id": listing_data.get("source_listing_id"),
                 "has_image": bool(listing_data.get("image_url") or listing_data.get("surface_image_url")),
             },
         )
         kwargs = await self.bot.build_listing_message_kwargs(listing_data)
         await interaction.followup.send(
             **kwargs,
-            view=view_cls(self.bot, self.db, listing_data),
+            view=action_view,
             ephemeral=True,
         )
+
+    @ui.button(label="🌐 View ChaseFiends", style=discord.ButtonStyle.green, row=4, custom_id="marketplace:source_toggle")
+    async def source_toggle_button(self, interaction: discord.Interaction, button: ui.Button):
+        if await self._reject_wrong_user(interaction):
+            return
+        self.source_filter = (
+            SOURCE_CHASEFIENDS
+            if self.source_filter == SOURCE_DISCORD
+            else SOURCE_DISCORD
+        )
+        self.search_query = ""
+        self.player_page = 0
+        self.price_filter = ""
+        self.listing_type_filter = ""
+        self.sort_mode = "newest"
+        self.index = 0
+        self.reset_to_first_on_refresh = True
+        log_marketplace_event(
+            self.db,
+            "marketplace_source_switched",
+            user_id=interaction.user.id,
+            details={"source": self.source_filter},
+        )
+        await self._edit(interaction)
 
     @ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=4, custom_id="marketplace:refresh")
     async def refresh_button(self, interaction: discord.Interaction, button: ui.Button):
@@ -1146,7 +1298,7 @@ async def _apply_listing_edit(
         db.upsert_seller_payment_methods(listing_data["seller_id"], payment_methods)
     if listing_data.get("message_id"):
         bot.active_listings[listing_data["message_id"]] = listing_data
-    if listing_data.get("listing_type") != "auction":
+    if listing_data.get("listing_type") != "auction" and not is_set_listing(listing_data):
         listing_data["price_assist"] = build_price_assist(_price_source(bot, db), listing_data)
 
     bumped = False
@@ -1199,6 +1351,196 @@ async def _apply_listing_edit(
             await interaction.response.send_message(message, ephemeral=True)
 
 
+class EditSetListingDetailsModal(ui.Modal, title="Edit Set Listing"):
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        self.set_name = ui.TextInput(label="Set Name", default=parent_view.set_name[:120], max_length=120)
+        self.subset = ui.TextInput(label="Subset", default=parent_view.subset[:120], max_length=120)
+        self.card_rarity = ui.TextInput(label="Rarity", default=parent_view.card_rarity[:40], max_length=40)
+        self.progress = ui.TextInput(
+            label="Cards Owned / Cards Total",
+            default=f"{parent_view.cards_owned}/{parent_view.cards_total}",
+            placeholder="30/30",
+            max_length=15,
+        )
+        self.price = ui.TextInput(label="Price", default=f"{parent_view.price:.2f}", max_length=20)
+        for item in (self.set_name, self.subset, self.card_rarity, self.progress, self.price):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            progress_parts = str(self.progress.value).replace(" ", "").split("/", 1)
+            if len(progress_parts) != 2:
+                raise ValueError("Set progress must use `owned/total`, such as `27/30`.")
+            cards_owned, cards_total = (int(value) for value in progress_parts)
+            if cards_owned < 0 or cards_total <= 0 or cards_owned > cards_total:
+                raise ValueError("Set progress must have 0 or more owned cards and owned cannot exceed total.")
+            price = parse_required_float(self.price.value, field_name="Price")
+            if price <= 0:
+                raise ValueError("Price must be greater than 0.")
+        except (TypeError, ValueError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.parent_view.set_name = str(self.set_name.value).strip()
+        self.parent_view.subset = str(self.subset.value).strip()
+        self.parent_view.card_rarity = str(self.card_rarity.value).strip().title()
+        self.parent_view.cards_owned = cards_owned
+        self.parent_view.cards_total = cards_total
+        self.parent_view.price = price
+        if self.parent_view.is_complete:
+            self.parent_view.missing_cards = ""
+        self.parent_view.sync_items()
+        await interaction.response.edit_message(
+            content=self.parent_view.selected_summary(),
+            view=self.parent_view,
+        )
+
+
+class EditSetMissingCardsModal(ui.Modal, title="Edit Missing Cards"):
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        self.missing_cards = ui.TextInput(
+            label="Missing Cards",
+            default=parent_view.missing_cards[:1000],
+            required=False,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.missing_cards)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.missing_cards = str(self.missing_cards.value or "").strip()
+        await interaction.response.edit_message(
+            content=self.parent_view.selected_summary(),
+            view=self.parent_view,
+        )
+
+
+class EditSetListingWorkflowView(ui.View):
+    def __init__(self, bot: "NBACollectBot", db: CardDatabase, listing_data: Dict[str, Any], owner_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.db = db
+        self.listing_data = listing_data
+        self.owner_id = owner_id
+        self.set_name = str(listing_data.get("set_name") or "")
+        self.subset = str(listing_data.get("subset") or "")
+        self.card_rarity = str(listing_data.get("card_rarity") or "")
+        self.cards_owned = int(listing_data.get("set_cards_owned") or 0)
+        self.cards_total = int(listing_data.get("set_cards_total") or listing_data.get("card_count") or 0)
+        self.includes_award = bool(listing_data.get("includes_award"))
+        self.missing_cards = str(listing_data.get("missing_cards") or "")
+        self.price = float(listing_data.get("price") or 0)
+        self.payment_methods = str(
+            listing_data.get("payment_methods")
+            or db.get_seller_payment_methods(listing_data.get("seller_id"))
+            or ""
+        )
+        self.details_button = ui.Button(label="✏️ Set Details", style=discord.ButtonStyle.blurple, row=0)
+        self.details_button.callback = self.on_details
+        self.award_button = ui.Button(row=0)
+        self.award_button.callback = self.on_award_toggle
+        self.missing_button = ui.Button(label="📝 Missing Cards", style=discord.ButtonStyle.secondary, row=1)
+        self.missing_button.callback = self.on_missing_cards
+        self.save_button = ui.Button(label="💾 Save Set Listing", style=discord.ButtonStyle.green, row=1)
+        self.save_button.callback = self.on_save
+        self.sync_items()
+
+    @property
+    def is_complete(self) -> bool:
+        return self.cards_total > 0 and self.cards_owned >= self.cards_total
+
+    def sync_items(self) -> None:
+        self.clear_items()
+        self.award_button.label = f"🏆 Includes Award: {'Yes' if self.includes_award else 'No'}"
+        self.award_button.style = discord.ButtonStyle.green if self.includes_award else discord.ButtonStyle.secondary
+        self.add_item(self.details_button)
+        self.add_item(self.award_button)
+        if not self.is_complete:
+            self.add_item(self.missing_button)
+        self.add_item(self.save_button)
+
+    def selected_summary(self) -> str:
+        lines = [
+            "**Edit set listing details**",
+            f"Set: **{self.set_name or 'Needs entry'}**",
+            f"Subset: **{self.subset or 'Needs entry'}**",
+            f"Rarity: **{self.card_rarity or 'Needs entry'}**",
+            f"Progress: **{self.cards_owned}/{self.cards_total} cards**",
+            f"Status: **{'Complete' if self.is_complete else 'Incomplete'}**",
+            f"Includes Award: **{'Yes' if self.includes_award else 'No'}**",
+        ]
+        if not self.is_complete:
+            lines.append(f"Missing Cards: **{self.missing_cards or 'Not provided'}**")
+        lines.append(f"Price: **${self.price:.2f}**")
+        return "\n".join(lines)
+
+    async def _reject_wrong_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return False
+        await interaction.response.send_message("Only the seller can edit this listing.", ephemeral=True)
+        return True
+
+    async def on_details(self, interaction: discord.Interaction):
+        if not await self._reject_wrong_user(interaction):
+            await interaction.response.send_modal(EditSetListingDetailsModal(self))
+
+    async def on_missing_cards(self, interaction: discord.Interaction):
+        if not await self._reject_wrong_user(interaction):
+            await interaction.response.send_modal(EditSetMissingCardsModal(self))
+
+    async def on_award_toggle(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        self.includes_award = not self.includes_award
+        self.sync_items()
+        await interaction.response.edit_message(content=self.selected_summary(), view=self)
+
+    async def on_save(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        if not self.set_name or not self.subset or not self.card_rarity or self.cards_total <= 0 or self.price <= 0:
+            await interaction.response.edit_message(
+                content=f"{self.selected_summary()}\n\nComplete all set details before saving.",
+                view=self,
+            )
+            return
+        await interaction.response.defer()
+        listing_id = _listing_id(self.listing_data)
+        async with self.bot.marketplace_lock(listing_id):
+            if str(self.db.get_marketplace_listing_status(listing_id) or "").lower() not in {"active", "open"}:
+                await interaction.followup.send("This listing changed before the edit could be saved.", ephemeral=True)
+                return
+            self.listing_data.update({
+                "listing_kind": "set",
+                "set_cards_owned": self.cards_owned,
+                "set_cards_total": self.cards_total,
+                "includes_award": self.includes_award,
+                "missing_cards": "" if self.is_complete else self.missing_cards,
+                "card_rarity": self.card_rarity,
+            })
+            await _apply_listing_edit(
+                self.bot,
+                self.db,
+                interaction,
+                self.listing_data,
+                player_names=self.set_name,
+                set_name=self.set_name,
+                subset=self.subset,
+                card_count=self.cards_total,
+                price=self.price,
+                payment_methods=self.payment_methods,
+                send_confirmation=False,
+            )
+        try:
+            await interaction.delete_original_response()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        self.stop()
+
+
 class EditListingDetailsModal(ui.Modal, title="Edit Listing Details"):
     def __init__(self, parent_view):
         super().__init__()
@@ -1216,9 +1558,11 @@ class EditListingDetailsModal(ui.Modal, title="Edit Listing Details"):
         )
         self.payment_methods = ui.TextInput(
             label="Payment Accounts (Platform: Username)",
-            default=str(parent_view.payment_methods or "")[:4000],
+            default=str(parent_view.payment_methods or "")[:1000],
             required=False,
             placeholder="Venmo: @name (one per line)",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
         )
         self.add_item(self.player_names)
         self.add_item(self.price)
@@ -1598,7 +1942,7 @@ class ListingReportModal(ui.Modal, title="Report Marketplace Listing"):
 
 
 class ListingActionView(ui.View):
-    """View with Claim and Make an Offer buttons for card listings."""
+    """View with Claim and Make an Offer buttons for fixed-price listings."""
 
     def __init__(self, bot: "NBACollectBot", db: CardDatabase, listing_data: Dict[str, Any]):
         super().__init__(timeout=None)
@@ -1608,6 +1952,9 @@ class ListingActionView(ui.View):
         self._sync_price_assist()
 
     def _sync_price_assist(self) -> None:
+        if is_set_listing(self.listing_data):
+            self.listing_data.pop("price_assist", None)
+            return
         price_assist = build_price_assist(_price_source(self.bot, self.db), self.listing_data)
         self.listing_data["price_assist"] = price_assist
         if not price_assist.get("results"):
@@ -1637,7 +1984,7 @@ class ListingActionView(ui.View):
         LOGGER.exception("Listing action failed")
         await _send_interaction_error(
             interaction,
-            "That marketplace action could not be completed. Please reopen Card Actions and try again.",
+            "That marketplace action could not be completed. Please reopen the listing actions and try again.",
         )
 
     async def reject_if_inactive(self, interaction: discord.Interaction) -> bool:
@@ -1784,7 +2131,8 @@ class ListingActionView(ui.View):
         if await self.reject_if_not_seller(interaction):
             return
 
-        view = EditListingWorkflowView(self.bot, self.db, self.listing_data, interaction.user.id)
+        view_cls = EditSetListingWorkflowView if is_set_listing(self.listing_data) else EditListingWorkflowView
+        view = view_cls(self.bot, self.db, self.listing_data, interaction.user.id)
         await interaction.response.send_message(
             view.selected_summary(),
             view=view,
@@ -2431,15 +2779,16 @@ async def finalize_bid_claim(
     else:
         buyer_title = "Your Offer Was Accepted!"
         seller_title = "Offer Accepted"
+    item_word = _listing_item_word(listing_data)
     buyer_description = (
-        f"You claimed this card for ${final_price:.2f}.\n\n"
+        f"You claimed this {item_word} for ${final_price:.2f}.\n\n"
         f"{_card_details_block(listing_data)}\n\n"
         f"{_seller_trust_text(db, listing_data.get('seller_id'))}\n\n"
         f"{_seller_contact_text(seller)}\n"
         f"{_seller_deal_details(db, listing_data)}"
     )
     seller_description = (
-        f"{bidder.name} claimed your card for ${final_price:.2f}.\n\n"
+        f"{bidder.name} claimed your {item_word} for ${final_price:.2f}.\n\n"
         f"{_buyer_trust_text(db, bidder.id)}\n\n"
         f"{_card_details_block(listing_data)}\n\n"
         f"{_buyer_contact_text(bidder)}\n"
@@ -2864,7 +3213,7 @@ class ClaimedListingView(ui.View):
             seller,
             content=(
                 f"The buyer marked **{self.listing_data.get('player_names', 'your listing')}** paid. "
-                "After you transfer the card, use Confirm Transfer & Complete."
+                f"After you transfer the {_listing_item_word(self.listing_data)}, use Confirm Transfer & Complete."
             ),
             view=ClaimedListingView(self.bot, self.db, self.listing_data),
         )
@@ -2913,6 +3262,11 @@ class ClaimedListingView(ui.View):
                     seller_id=self.listing_data["seller_id"],
                     card_rarity=self.listing_data.get("card_rarity"),
                     source_listing_id=listing_id,
+                    listing_kind=self.listing_data.get("listing_kind", "player"),
+                    set_cards_owned=self.listing_data.get("set_cards_owned"),
+                    set_cards_total=self.listing_data.get("set_cards_total"),
+                    includes_award=bool(self.listing_data.get("includes_award")),
+                    missing_cards=self.listing_data.get("missing_cards"),
                 )
                 sheet_synced = bool(result.get("sheet_synced", False)) if isinstance(result, dict) else True
             else:
@@ -2926,6 +3280,11 @@ class ClaimedListingView(ui.View):
                     seller_id=self.listing_data["seller_id"],
                     card_rarity=self.listing_data.get("card_rarity"),
                     source_listing_id=listing_id,
+                    listing_kind=self.listing_data.get("listing_kind", "player"),
+                    set_cards_owned=self.listing_data.get("set_cards_owned"),
+                    set_cards_total=self.listing_data.get("set_cards_total"),
+                    includes_award=bool(self.listing_data.get("includes_award")),
+                    missing_cards=self.listing_data.get("missing_cards"),
                 )
             transitioned = self.db.transition_marketplace_listing(
                 listing_id,

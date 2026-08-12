@@ -116,6 +116,11 @@ class PriceSheet:
             "Sale Type": "Discord Marketplace",
             "Source Listing ID": str(source_listing_id or ""),
             "Listing ID": str(source_listing_id or ""),
+            "Listing Kind": payload.get("listing_kind", "player"),
+            "Set Cards Owned": payload.get("set_cards_owned", ""),
+            "Set Cards Total": payload.get("set_cards_total", ""),
+            "Includes Award": "Yes" if payload.get("includes_award") else "No",
+            "Missing Cards": payload.get("missing_cards", ""),
         }
         row = [aliases.get(header, "") for header in headers]
         self.sheet.insert_row(row, index=header_index + 2)
@@ -132,6 +137,11 @@ class PriceSheet:
         image_url: str = None,
         card_rarity: str = "Legendary",
         source_listing_id: int = None,
+        listing_kind: str = "player",
+        set_cards_owned: int = None,
+        set_cards_total: int = None,
+        includes_award: bool = False,
+        missing_cards: str = None,
     ):
         """Add a sale to both the database and Google Sheets."""
         # Add to database
@@ -146,6 +156,11 @@ class PriceSheet:
             image_url=image_url,
             card_rarity=card_rarity,
             source_listing_id=source_listing_id,
+            listing_kind=listing_kind,
+            set_cards_owned=set_cards_owned,
+            set_cards_total=set_cards_total,
+            includes_award=includes_award,
+            missing_cards=missing_cards,
         )
 
         # Add to Google Sheets as backup
@@ -166,6 +181,11 @@ class PriceSheet:
             "seller_id": seller_id,
             "image_url": image_url,
             "source_listing_id": source_listing_id,
+            "listing_kind": listing_kind,
+            "set_cards_owned": set_cards_owned,
+            "set_cards_total": set_cards_total,
+            "includes_award": includes_award,
+            "missing_cards": missing_cards,
         }
 
         try:

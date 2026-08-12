@@ -6,6 +6,7 @@ import discord
 
 from parsers import listing_matches_notify_rule
 from logger import LOGGER, log_marketplace_event
+from marketplace import is_set_listing
 from price_assist import build_price_assist
 from serializers import build_listing_embed
 
@@ -133,7 +134,7 @@ async def publish_listing(
     listing_data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
     view_cls = AuctionActionView if listing_data.get("listing_type") == "auction" else ListingActionView
     view = view_cls(bot, db, listing_data)
-    if listing_data.get("listing_type") != "auction":
+    if listing_data.get("listing_type") != "auction" and not is_set_listing(listing_data):
         listing_data["price_assist"] = build_price_assist(getattr(bot, "sheet", None) or db, listing_data)
         log_marketplace_event(
             db,
@@ -201,6 +202,7 @@ async def publish_listing(
             "player_names": listing_data.get("player_names"),
             "price": listing_data.get("price"),
             "listing_type": listing_data.get("listing_type", "sale"),
+            "listing_kind": listing_data.get("listing_kind", "player"),
         },
     )
     if notify_users:

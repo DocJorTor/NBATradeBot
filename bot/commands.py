@@ -29,7 +29,8 @@ from components import (
 from config import format_subset_for_set, has_subset_variants
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
-from ocr import extract_listing_metadata
+from marketplace import LISTING_KIND_SET, active_marketplace_inventory
+from ocr import extract_listing_metadata, extract_set_listing_metadata
 from parsers import format_sheet_datetime, normalize_player_name, parse_required_float
 from price_assist import (
     PriceResultsView as SharedPriceResultsView,
@@ -164,11 +165,7 @@ def _listing_activity_sort_key(listing: dict) -> tuple[datetime, int]:
 
 
 def _get_active_marketplace_listings(bot: "NBACollectBot") -> list[dict]:
-    listings = [
-        listing
-        for listing in (getattr(bot, "active_listings", {}) or {}).values()
-        if str(listing.get("status", "active")).lower() in {"active", "open"}
-    ]
+    listings = active_marketplace_inventory(bot)
     listings.sort(key=_listing_newest_sort_key, reverse=True)
     return listings
 
@@ -683,15 +680,17 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "Search recent card sales. You can leave the player blank, then filter by set, subset, and card count.\n\n"
                 "`🔔 Notifications`\n"
                 "View your active alerts, then use `🔔 Add Notification` or `🔕 Remove Notification`.\n\n"
-                "`🏷️ List Player`\n"
+                "`🏷️ List a Player`\n"
                 "Create a fixed-price card listing with image upload.\n\n"
-                "`🔨 Auction Player`\n"
+                "`📚 List a Set`\n"
+                "Create a fixed-price complete or incomplete set listing from a collection screenshot.\n\n"
+                "`🔨 Auction a Player`\n"
                 "Create a timed auction with image upload.\n\n"
                 "`🛒 Marketplace`\n"
                 "Browse active marketplace listings in one carousel. Claim listings, make offers, bid on auctions, and record transactions.\n\n"
                 "`📊 View Status`\n"
                 "View your active listings, offers, auction bids, claims, and notifications. This response is private.\n\n"
-                "`👤 My Profile`\n"
+                "`👤 Account`\n"
                 "Set your Topps Collect IGN, private payment account usernames, and public payment notes. The profile panel itself is private.\n\n"
                 "`💬 Leave Feedback`\n"
                 "Use the button below to report missing sets, subsets, players, bugs, disputes, or general feedback."
@@ -1848,6 +1847,412 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     ephemeral=True,
                 )
 
+    async def list_a_set(interaction: discord.Interaction):
+        profile_ready, _profile = marketplace_profile_status(
+            db,
+            interaction.user.id,
+            require_payments=True,
+        )
+        if not profile_ready:
+            async def resume_listing(profile_interaction: discord.Interaction) -> None:
+                await list_a_set(profile_interaction)
+
+            await interaction.response.send_modal(
+                MarketplaceProfileModal(
+                    db,
+                    interaction.user.id,
+                    bot=bot,
+                    require_payments=True,
+                    after_save=resume_listing,
+                )
+            )
+            return
+
+        upload_sessions = getattr(bot, "listing_upload_sessions", None)
+        if upload_sessions is None:
+            upload_sessions = set()
+            bot.listing_upload_sessions = upload_sessions
+        upload_session_key = (interaction.user.id, interaction.channel_id)
+        if upload_session_key in upload_sessions:
+            await interaction.response.send_message(
+                "You already have a listing image upload in progress in this channel.",
+                ephemeral=True,
+            )
+            return
+        upload_sessions.add(upload_session_key)
+
+        sale_channel = bot.get_channel(bot.sale_channel_id)
+        if sale_channel is None:
+            try:
+                sale_channel = await bot.fetch_channel(bot.sale_channel_id)
+            except Exception as exc:
+                LOGGER.error("Could not fetch sale channel: %s", exc)
+                sale_channel = None
+
+        class SetDetailsModal(ui.Modal, title="Set Listing Details"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.set_name = ui.TextInput(
+                    label="Set Name",
+                    default=str(parent_view.set_name or "")[:120],
+                    required=True,
+                    max_length=120,
+                )
+                self.subset = ui.TextInput(
+                    label="Subset",
+                    default=str(parent_view.subset or "")[:120],
+                    required=True,
+                    max_length=120,
+                )
+                self.card_rarity = ui.TextInput(
+                    label="Rarity",
+                    default=str(parent_view.card_rarity or "")[:40],
+                    required=True,
+                    max_length=40,
+                )
+                self.price = ui.TextInput(
+                    label="Listing Price",
+                    placeholder="25.00",
+                    default="" if parent_view.price is None else f"{parent_view.price:.2f}",
+                    required=True,
+                    max_length=20,
+                )
+                for item in (self.set_name, self.subset, self.card_rarity, self.price):
+                    self.add_item(item)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                try:
+                    price = parse_required_float(self.price.value, field_name="Price")
+                    if price <= 0:
+                        raise ValueError("Price must be greater than 0.")
+                except ValueError as exc:
+                    await interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                self.parent_view.set_name = str(self.set_name.value).strip()
+                self.parent_view.subset = str(self.subset.value).strip()
+                self.parent_view.card_rarity = str(self.card_rarity.value).strip().title()
+                self.parent_view.price = price
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class SetProgressModal(ui.Modal, title="Set Progress"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.cards_owned = ui.TextInput(
+                    label="Cards Owned",
+                    placeholder="30",
+                    default="" if parent_view.cards_owned is None else str(parent_view.cards_owned),
+                    required=True,
+                    max_length=5,
+                )
+                self.cards_total = ui.TextInput(
+                    label="Cards Total",
+                    placeholder="30",
+                    default="" if parent_view.cards_total is None else str(parent_view.cards_total),
+                    required=True,
+                    max_length=5,
+                )
+                self.add_item(self.cards_owned)
+                self.add_item(self.cards_total)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                try:
+                    cards_owned = int(str(self.cards_owned.value).strip())
+                    cards_total = int(str(self.cards_total.value).strip())
+                    if cards_owned < 0 or cards_total <= 0:
+                        raise ValueError
+                    if cards_owned > cards_total:
+                        await interaction.response.send_message(
+                            "Cards owned cannot be greater than cards total.",
+                            ephemeral=True,
+                        )
+                        return
+                except (TypeError, ValueError):
+                    await interaction.response.send_message(
+                        "Cards owned and cards total must be valid whole numbers.",
+                        ephemeral=True,
+                    )
+                    return
+                self.parent_view.cards_owned = cards_owned
+                self.parent_view.cards_total = cards_total
+                if self.parent_view.is_complete:
+                    self.parent_view.missing_cards = ""
+                self.parent_view.sync_items()
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class MissingCardsModal(ui.Modal, title="Missing Cards"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.missing_cards = ui.TextInput(
+                    label="Missing Cards",
+                    placeholder="List the cards missing from this set",
+                    default=str(parent_view.missing_cards or "")[:1000],
+                    required=False,
+                    max_length=1000,
+                    style=discord.TextStyle.paragraph,
+                )
+                self.add_item(self.missing_cards)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                self.parent_view.missing_cards = str(self.missing_cards.value or "").strip()
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class ListSetView(ui.View):
+            def __init__(self, image_url, image_bytes, metadata_guess):
+                super().__init__(timeout=300)
+                self.image_url = image_url
+                self.image_bytes = image_bytes
+                self.image_filename = "set_image.png"
+                self.set_name = metadata_guess.set_name
+                self.subset = metadata_guess.subset
+                self.card_rarity = metadata_guess.card_rarity
+                self.cards_owned = metadata_guess.cards_owned
+                self.cards_total = metadata_guess.cards_total
+                self.price = None
+                self.includes_award = False
+                self.missing_cards = ""
+                self.review_message = None
+
+                self.details_button = ui.Button(
+                    label="✏️ Set Details",
+                    style=discord.ButtonStyle.blurple,
+                    row=0,
+                )
+                self.details_button.callback = self.on_details
+                self.progress_button = ui.Button(
+                    label="📊 Set Progress",
+                    style=discord.ButtonStyle.secondary,
+                    row=0,
+                )
+                self.progress_button.callback = self.on_progress
+                self.award_button = ui.Button(row=1)
+                self.award_button.callback = self.on_award_toggle
+                self.missing_button = ui.Button(
+                    label="📝 Missing Cards",
+                    style=discord.ButtonStyle.secondary,
+                    row=1,
+                )
+                self.missing_button.callback = self.on_missing_cards
+                self.submit_button = ui.Button(
+                    label="🏷️ Create Set Listing",
+                    style=discord.ButtonStyle.green,
+                    row=2,
+                )
+                self.submit_button.callback = self.on_submit
+                self.sync_items()
+
+            @property
+            def is_complete(self) -> bool:
+                return (
+                    self.cards_owned is not None
+                    and self.cards_total is not None
+                    and self.cards_total > 0
+                    and self.cards_owned >= self.cards_total
+                )
+
+            def sync_items(self) -> None:
+                self.clear_items()
+                self.award_button.label = (
+                    "🏆 Includes Award: Yes"
+                    if self.includes_award
+                    else "🏆 Includes Award: No"
+                )
+                self.award_button.style = (
+                    discord.ButtonStyle.green
+                    if self.includes_award
+                    else discord.ButtonStyle.secondary
+                )
+                self.add_item(self.details_button)
+                self.add_item(self.progress_button)
+                self.add_item(self.award_button)
+                if not self.is_complete:
+                    self.add_item(self.missing_button)
+                self.add_item(self.submit_button)
+
+            def selected_summary(self) -> str:
+                progress = (
+                    f"{self.cards_owned}/{self.cards_total} cards"
+                    if self.cards_owned is not None and self.cards_total is not None
+                    else "Needs entry"
+                )
+                lines = [
+                    "**Review set listing details**",
+                    f"Set: **{self.set_name or 'Needs entry'}**",
+                    f"Subset: **{self.subset or 'Needs entry'}**",
+                    f"Rarity: **{self.card_rarity or 'Needs entry'}**",
+                    f"Progress: **{progress}**",
+                    f"Status: **{'Complete' if self.is_complete else 'Incomplete'}**",
+                    f"Includes Award: **{'Yes' if self.includes_award else 'No'}**",
+                ]
+                if not self.is_complete:
+                    lines.append(f"Missing Cards: **{self.missing_cards or 'Not provided'}**")
+                lines.append(
+                    f"Price: **{_format_price(self.price)}**"
+                    if self.price is not None
+                    else "Price: **Needs entry before creating**"
+                )
+                return "\n".join(lines)
+
+            async def on_details(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(SetDetailsModal(self))
+
+            async def on_progress(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(SetProgressModal(self))
+
+            async def on_missing_cards(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(MissingCardsModal(self))
+
+            async def on_award_toggle(self, interaction: discord.Interaction):
+                self.includes_award = not self.includes_award
+                self.sync_items()
+                await interaction.response.edit_message(
+                    content=self.selected_summary(),
+                    view=self,
+                )
+
+            async def on_submit(self, interaction: discord.Interaction):
+                if not self.set_name or not self.subset or not self.card_rarity or self.price is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Use Set Details and provide the set, subset, rarity, and price.",
+                    )
+                    return
+                if self.cards_owned is None or self.cards_total is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Use Set Progress before submitting.",
+                    )
+                    return
+                if sale_channel is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Sale channel is not configured or could not be found. Please contact an admin.",
+                    )
+                    return
+
+                payment_methods = db.get_seller_payment_methods(interaction.user.id)
+                if not payment_methods:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Add payment accounts in Account before creating this listing.",
+                    )
+                    return
+                profile = db.get_marketplace_profile(interaction.user.id) or {}
+                listing_data = {
+                    "listing_kind": LISTING_KIND_SET,
+                    "player_names": self.set_name,
+                    "set_name": self.set_name,
+                    "subset": self.subset,
+                    "card_count": self.cards_total,
+                    "card_rarity": self.card_rarity,
+                    "set_cards_owned": self.cards_owned,
+                    "set_cards_total": self.cards_total,
+                    "includes_award": self.includes_award,
+                    "missing_cards": "" if self.is_complete else self.missing_cards,
+                    "price": self.price,
+                    "date_time": format_sheet_datetime(),
+                    "seller": interaction.user,
+                    "seller_id": interaction.user.id,
+                    "status": "active",
+                    "image_url": None,
+                    "bids": [],
+                    "payment_methods": payment_methods,
+                    "payment_notes": profile.get("payment_notes"),
+                }
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+                image_file = None
+                if self.image_bytes:
+                    image_file = discord.File(io.BytesIO(self.image_bytes), filename=self.image_filename)
+                    listing_data["image_url"] = f"attachment://{self.image_filename}"
+                    listing_data["image_bytes"] = self.image_bytes
+                    listing_data["image_filename"] = self.image_filename
+                else:
+                    listing_data["image_url"] = self.image_url
+                await publish_listing(
+                    bot,
+                    db,
+                    sale_channel,
+                    interaction,
+                    listing_data,
+                    image_file=image_file,
+                    notify_users=False,
+                )
+                await _finish_listing_workflow_message(interaction, self.review_message)
+                self.stop()
+
+        await interaction.response.send_message(
+            "Please upload the set image in this channel within 2 minutes.",
+            ephemeral=True,
+        )
+        try:
+            image_url, _image_file, image_bytes = await collect_listing_image(
+                bot,
+                db,
+                interaction,
+                None,
+            )
+        finally:
+            upload_sessions.discard(upload_session_key)
+
+        if not image_bytes and not image_url:
+            await _edit_original_workflow_status(interaction, "No image was received.")
+            await interaction.followup.send(
+                "An image is required, so the set listing was not started. Use List a Set when you are ready to upload.",
+                ephemeral=True,
+            )
+            return
+
+        await _edit_original_workflow_status(interaction, "Image received. Reading set details...")
+        ocr_started_at = time.perf_counter()
+        metadata_guess = await asyncio.to_thread(extract_set_listing_metadata, image_bytes)
+        ocr_elapsed_ms = int((time.perf_counter() - ocr_started_at) * 1000)
+        log_marketplace_event(
+            db,
+            "set_listing_ocr_processed",
+            user_id=interaction.user.id,
+            details={
+                "engine": metadata_guess.engine,
+                "ocr_available": metadata_guess.ocr_available,
+                "set_name": metadata_guess.set_name,
+                "subset": metadata_guess.subset,
+                "card_rarity": metadata_guess.card_rarity,
+                "cards_owned": metadata_guess.cards_owned,
+                "cards_total": metadata_guess.cards_total,
+                "elapsed_ms": ocr_elapsed_ms,
+                "confidence": metadata_guess.confidence,
+            },
+        )
+        view = ListSetView(image_url, image_bytes, metadata_guess)
+        try:
+            view.review_message = await interaction.edit_original_response(
+                content=view.selected_summary(),
+                view=view,
+            )
+        except discord.DiscordException:
+            view.review_message = await interaction.followup.send(
+                view.selected_summary(),
+                view=view,
+                ephemeral=True,
+                wait=True,
+            )
+
+
     async def auction_a_player(
         interaction: discord.Interaction,
         player_name: str = None,
@@ -2657,6 +3062,25 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
     class BotInterfaceView(ui.View):
         def __init__(self):
             super().__init__(timeout=None)
+            button_order = [
+                "nba_bot:price",
+                "nba_bot:open_marketplace",
+                "nba_bot:notifications",
+                "nba_bot:list_player",
+                "nba_bot:list_set",
+                "nba_bot:auction_player",
+                "nba_bot:help",
+                "nba_bot:profile",
+                "nba_bot:status",
+            ]
+            buttons = {
+                child.custom_id: child
+                for child in self.children
+                if getattr(child, "custom_id", None)
+            }
+            self.clear_items()
+            for custom_id in button_order:
+                self.add_item(buttons[custom_id])
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             nba_bot_channel = await bot.resolve_nba_bot_channel()
@@ -2668,11 +3092,15 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             )
             return False
 
-        @ui.button(label="🏷️ List Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=1)
+        @ui.button(label="🏷️ List a Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=1)
         async def list_player_button(self, interaction: discord.Interaction, button: ui.Button):
             await list_a_player(interaction)
 
-        @ui.button(label="🔨 Auction Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=1)
+        @ui.button(label="📚 List a Set", style=discord.ButtonStyle.green, custom_id="nba_bot:list_set", row=1)
+        async def list_set_button(self, interaction: discord.Interaction, button: ui.Button):
+            await list_a_set(interaction)
+
+        @ui.button(label="🔨 Auction a Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=1)
         async def auction_player_button(self, interaction: discord.Interaction, button: ui.Button):
             await auction_a_player(interaction)
 
@@ -2680,11 +3108,11 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         async def price_button(self, interaction: discord.Interaction, button: ui.Button):
             await price(interaction)
 
-        @ui.button(label="📊 View Status", style=discord.ButtonStyle.blurple, custom_id="nba_bot:status", row=3)
+        @ui.button(label="📊 View Status", style=discord.ButtonStyle.secondary, custom_id="nba_bot:status", row=2)
         async def status_button(self, interaction: discord.Interaction, button: ui.Button):
             await status(interaction)
 
-        @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=3)
+        @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=0)
         async def notifications_button(self, interaction: discord.Interaction, button: ui.Button):
             await interaction.response.send_message(
                 _notification_hub_content(interaction.user.id),
@@ -2692,11 +3120,11 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ephemeral=True,
             )
 
-        @ui.button(label="❓ Help & Feedback", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=4)
+        @ui.button(label="❓ Help & Feedback", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=2)
         async def help_button(self, interaction: discord.Interaction, button: ui.Button):
             await help_command(interaction)
 
-        @ui.button(label="👤 Account", style=discord.ButtonStyle.secondary, custom_id="nba_bot:profile", row=4)
+        @ui.button(label="👤 Account", style=discord.ButtonStyle.secondary, custom_id="nba_bot:profile", row=2)
         async def profile_button(self, interaction: discord.Interaction, button: ui.Button):
             profile_ready, _profile = marketplace_profile_status(db, interaction.user.id)
             if not profile_ready:
