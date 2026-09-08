@@ -15,6 +15,7 @@ sys.path.insert(0, str(BOT_DIR))
 
 from database import CardDatabase
 from commands import register_bot_interface
+from components import CUSTOM_CARD_COUNT_VALUE, build_card_count_options, on_card_count_select
 from marketplace import (
     LISTING_KIND_SET,
     SOURCE_CHASEFIENDS,
@@ -339,6 +340,7 @@ class MarketplaceDatabaseTests(unittest.TestCase):
             [
                 ("nba_bot:price", 0),
                 ("nba_bot:open_marketplace", 0),
+                ("nba_bot:showcase", 0),
                 ("nba_bot:notifications", 0),
                 ("nba_bot:list_player", 1),
                 ("nba_bot:list_set", 1),
@@ -346,8 +348,40 @@ class MarketplaceDatabaseTests(unittest.TestCase):
                 ("nba_bot:help", 2),
                 ("nba_bot:profile", 2),
                 ("nba_bot:status", 2),
+                ("nba_bot:add_set", 3),
             ],
         )
+
+    def test_custom_sets_and_showcase_cards_persist(self):
+        self.db.upsert_custom_set("2027 Test Set", ["Base", "Gold"], added_by=42)
+        self.assertEqual(self.db.get_custom_sets()[0]["subsets"], ["Base", "Gold"])
+
+        for index in range(5):
+            self.db.add_showcase_card(
+                42, "Collector", f"Player {index}", "2027 Test Set", "Favorite", b"image"
+            )
+        self.assertEqual(len(self.db.get_showcase_cards(42)), 5)
+        with self.assertRaises(ValueError):
+            self.db.add_showcase_card(42, "Collector", "Sixth", "Set", "", b"image")
+        first = self.db.get_showcase_cards(42)[0]
+        self.assertTrue(self.db.delete_showcase_card(first["id"], 42))
+
+    def test_notes_are_searchable_and_persist_on_listings(self):
+        listing = {**self.listing, "additional_information": "NBA debut career high"}
+        self.db.upsert_marketplace_listing(listing)
+        self.assertEqual(
+            self.db.get_open_marketplace_listings()[0]["additional_information"],
+            "NBA debut career high",
+        )
+        self.db.add_sale(
+            "LeBron James", "Base", "Gold", "2026-01-01", 25, 99,
+            additional_information="ROTY award",
+            buying_format="Fixed Price",
+            platform="Discord",
+        )
+        results = self.db.query_player(additional_information="roty")
+        self.assertEqual(results[0]["buying_format"], "Fixed Price")
+        self.assertEqual(results[0]["platform"], "Discord")
 
     def test_static_chasefiends_snapshot_is_sanitized_and_combined(self):
         external = load_chasefiends_snapshot()
@@ -455,6 +489,37 @@ class MarketplaceDatabaseTests(unittest.TestCase):
 
 
 class MarketplaceFormattingTests(unittest.TestCase):
+    def test_card_count_options_support_custom_values(self):
+        options = build_card_count_options(selected_value="125", include_any=False)
+        self.assertEqual(options[0].value, "125")
+        self.assertTrue(options[0].default)
+        self.assertIn(CUSTOM_CARD_COUNT_VALUE, {option.value for option in options})
+
+    def test_card_count_preset_selection_ignores_custom_sentinel(self):
+        class Response:
+            def __init__(self):
+                self.edited = False
+
+            async def edit_message(self, **kwargs):
+                self.edited = True
+
+        response = Response()
+        view = SimpleNamespace(
+            card_count_value=None,
+            card_count_select=SimpleNamespace(
+                values=["250"],
+                options=build_card_count_options(selected_value="ANY"),
+            ),
+        )
+
+        asyncio.run(on_card_count_select(view, SimpleNamespace(response=response)))
+
+        self.assertEqual(view.card_count_value, 250)
+        self.assertTrue(response.edited)
+        defaults = {option.value: option.default for option in view.card_count_select.options}
+        self.assertTrue(defaults["250"])
+        self.assertFalse(defaults[CUSTOM_CARD_COUNT_VALUE])
+
     def test_public_payment_summary_never_exposes_account_values(self):
         summary = _public_payment_platforms(
             "PayPal: private@example.com\nVenmo: @private-user\nprivate-legacy-value"
@@ -639,6 +704,34 @@ class PriceSheetTests(unittest.TestCase):
                 "NBA Finals Mega Pack", "NBA Finals Mega Pack", "White Retro", "Uncommon",
                 "set", 27, 30, "Yes", "Cards 4, 12, and 29", "",
             ],
+        )
+
+    def test_transaction_format_platform_and_notes_map_to_sheet(self):
+        class FakeSheet:
+            def __init__(self):
+                self.rows = [[
+                    "Player Name(s)", "Set", "Price", "Buying Format", "Platform",
+                    "Additional Information",
+                ]]
+                self.inserted = []
+            def get_all_values(self):
+                return self.rows
+            def insert_row(self, row, index):
+                self.inserted.append(row)
+
+        price_sheet = PriceSheet.__new__(PriceSheet)
+        price_sheet.sheet = FakeSheet()
+        price_sheet._insert_sale_row({
+            "player_names": "Victor Wembanyama",
+            "set_name": "Topps Now",
+            "price": 50,
+            "buying_format": "Auction",
+            "platform": "Discord",
+            "additional_information": "NBA debut",
+        })
+        self.assertEqual(
+            price_sheet.sheet.inserted[0],
+            ["Victor Wembanyama", "Topps Now", 50, "Auction", "Discord", "NBA debut"],
         )
 
 

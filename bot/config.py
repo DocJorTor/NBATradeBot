@@ -116,6 +116,15 @@ def get_set_names() -> list[str]:
     return list(SET_SUBSETS.keys())
 
 
+def register_custom_set(set_name: str, subsets: list[str]) -> None:
+    """Add or update a runtime set definition loaded from persistent storage."""
+    clean_name = str(set_name or "").strip()
+    clean_subsets = list(dict.fromkeys(str(value).strip() for value in subsets if str(value).strip()))
+    if not clean_name or not clean_subsets:
+        raise ValueError("Set name and at least one subset are required.")
+    SET_SUBSETS[clean_name] = clean_subsets
+
+
 def _iter_subset_items(set_name: str):
     return SET_SUBSETS.get(set_name, [])
 

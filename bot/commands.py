@@ -26,7 +26,7 @@ from components import (
     on_subset_select,
     on_variant_select,
 )
-from config import format_subset_for_set, has_subset_variants
+from config import format_subset_for_set, has_subset_variants, register_custom_set
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
 from marketplace import LISTING_KIND_SET, active_marketplace_inventory
@@ -670,6 +670,12 @@ class StatusActionsView(ui.View):
         )
 
 def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase) -> None:
+    for stored_set in db.get_custom_sets():
+        try:
+            register_custom_set(stored_set["set_name"], stored_set["subsets"])
+        except ValueError:
+            LOGGER.warning("Ignored invalid stored custom set %r", stored_set.get("set_name"))
+
     async def help_command(interaction: discord.Interaction):
 
         embed = discord.Embed(
@@ -688,10 +694,14 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "Create a timed auction with image upload.\n\n"
                 "`🛒 Marketplace`\n"
                 "Browse active marketplace listings in one carousel. Claim listings, make offers, bid on auctions, and record transactions.\n\n"
+                "`✨ Showcase`\n"
+                "Browse members' favorite cards, or add up to five cards to your own showcase.\n\n"
                 "`📊 View Status`\n"
                 "View your active listings, offers, auction bids, claims, and notifications. This response is private.\n\n"
                 "`👤 Account`\n"
                 "Set your Topps Collect IGN, private payment account usernames, and public payment notes. The profile panel itself is private.\n\n"
+                "`🛠️ Add Set (Mods)`\n"
+                "Moderators can add or update sets and subsets without changing bot code.\n\n"
                 "`💬 Leave Feedback`\n"
                 "Use the button below to report missing sets, subsets, players, bugs, disputes, or general feedback."
             ),
@@ -1111,6 +1121,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_variant_value = None
                 self.subset_value = None
                 self.card_count_value = None
+                self.additional_information = None
                 self.sync_filter_items()
 
             def _variant_required(self) -> bool:
@@ -1174,7 +1185,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.submit_button.callback = self.on_submit
                 self.add_item(self.submit_button)
                 self.player_button = ui.Button(
-                    label="🔍 Select Player",
+                    label="🔍 Player / Notes",
                     style=discord.ButtonStyle.blurple,
                     row=4,
                 )
@@ -1209,18 +1220,25 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     f"Player: `{player_display}`\n"
                     f"Set: `{set_display}`\n"
                     f"Subset: `{subset_display}`\n"
-                    f"Card Count: `{card_count_display}`"
+                    f"Card Count: `{card_count_display}`\n"
+                    f"Notes: `{self.additional_information or 'Any Notes'}`"
                 )
 
             async def on_player_name(self, interaction: discord.Interaction):
-                await interaction.response.send_modal(
-                    PlayerNamePromptModal(
-                        "Search Player",
-                        self.on_player_name_submit,
-                        normalizer=normalize_player_name,
-                        initial_value=self.player_name,
-                    )
-                )
+                parent_view = self
+                class PriceTextModal(ui.Modal, title="Price Search Text"):
+                    def __init__(self):
+                        super().__init__()
+                        self.player = ui.TextInput(label="Player Name", required=False, default=str(parent_view.player_name or "")[:120], max_length=120)
+                        self.notes = ui.TextInput(label="Notes / Additional Information", placeholder="Debut, career high, ROTY, award...", required=False, default=str(parent_view.additional_information or "")[:200], max_length=200)
+                        self.add_item(self.player)
+                        self.add_item(self.notes)
+                    async def on_submit(self, modal_interaction: discord.Interaction):
+                        parent_view.player_name = normalize_player_name(self.player.value)
+                        parent_view.additional_information = str(self.notes.value or "").strip() or None
+                        parent_view.sync_filter_items()
+                        await modal_interaction.response.edit_message(content=parent_view.selected_summary(), view=parent_view)
+                await interaction.response.send_modal(PriceTextModal())
 
             async def on_player_name_submit(self, interaction: discord.Interaction, player_name: str | None):
                 self.player_name = player_name
@@ -1234,6 +1252,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_variant_value = None
                 self.subset_value = None
                 self.card_count_value = None
+                self.additional_information = None
                 self.set_option_order = None
                 self.subset_option_order = None
                 self.variant_option_order = None
@@ -1293,6 +1312,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     set_name=set_name,
                     cc=cc,
                     subset=subset,
+                    additional_information=self.additional_information,
                 )
                 log_marketplace_event(
                     db,
@@ -1303,6 +1323,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                         "set_name": set_name,
                         "subset": subset,
                         "card_count": cc,
+                        "additional_information": self.additional_information,
                         "result_count": len(results),
                     },
                     level=20,
@@ -1317,6 +1338,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                             "set_name": set_name,
                             "subset": subset,
                             "card_count": cc,
+                            "additional_information": self.additional_information,
                         },
                         level=20,
                     )
@@ -1522,8 +1544,24 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     required=False,
                     max_length=20,
                 )
+                self.rarity = ui.TextInput(
+                    label="Rarity",
+                    placeholder="Common, Rare, Super Rare...",
+                    default=str(parent_view.card_rarity or "")[:40],
+                    required=False,
+                    max_length=40,
+                )
+                self.notes = ui.TextInput(
+                    label="Notes / Additional Information",
+                    placeholder="Debut, career high, ROTY, award...",
+                    default=str(parent_view.additional_information or "")[:300],
+                    required=False,
+                    max_length=300,
+                )
                 self.add_item(self.player_name)
                 self.add_item(self.price)
+                self.add_item(self.rarity)
+                self.add_item(self.notes)
 
             async def on_submit(self, interaction: discord.Interaction):
                 player_name = normalize_player_name(self.player_name.value)
@@ -1544,6 +1582,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
 
                 self.parent_view.player_name = player_name
                 self.parent_view.price = price
+                self.parent_view.card_rarity = str(self.rarity.value or "").strip().title() or None
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
                 await update_listing_review(interaction, self.parent_view)
 
         class ListPlayerView(ui.View):
@@ -1567,6 +1607,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_value = metadata_guess.subset_value
                 self.card_count_value = metadata_guess.card_count
                 self.card_rarity = metadata_guess.card_rarity
+                self.additional_information = None
                 self.set_option_order = metadata_guess.set_option_order
                 self.subset_option_order = metadata_guess.subset_option_order
                 self.variant_option_order = metadata_guess.variant_option_order
@@ -1669,6 +1710,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ]
                 if self.card_rarity:
                     details.append(f"Rarity: **{self.card_rarity}**")
+                if self.additional_information:
+                    details.append(f"Notes: **{self.additional_information}**")
                 details.append(
                     f"Price: **{_format_price(self.price)}**"
                     if self.price is not None
@@ -1749,6 +1792,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     "subset": self.subset_value,
                     "card_count": self.card_count_value,
                     "card_rarity": self.card_rarity,
+                    "additional_information": self.additional_information,
                     "price": self.price,
                     "date_time": format_sheet_datetime(),
                     "seller": interaction.user,
@@ -1918,7 +1962,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     required=True,
                     max_length=20,
                 )
-                for item in (self.set_name, self.subset, self.card_rarity, self.price):
+                self.notes = ui.TextInput(label="Notes / Additional Information", required=False, default=str(parent_view.additional_information or "")[:300], max_length=300)
+                for item in (self.set_name, self.subset, self.card_rarity, self.price, self.notes):
                     self.add_item(item)
 
             async def on_submit(self, interaction: discord.Interaction):
@@ -1932,6 +1977,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.parent_view.set_name = str(self.set_name.value).strip()
                 self.parent_view.subset = str(self.subset.value).strip()
                 self.parent_view.card_rarity = str(self.card_rarity.value).strip().title()
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
                 self.parent_view.price = price
                 await interaction.response.edit_message(
                     content=self.parent_view.selected_summary(),
@@ -2022,6 +2068,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.price = None
                 self.includes_award = False
                 self.missing_cards = ""
+                self.additional_information = None
                 self.review_message = None
 
                 self.details_button = ui.Button(
@@ -2097,6 +2144,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ]
                 if not self.is_complete:
                     lines.append(f"Missing Cards: **{self.missing_cards or 'Not provided'}**")
+                if self.additional_information:
+                    lines.append(f"Notes: **{self.additional_information}**")
                 lines.append(
                     f"Price: **{_format_price(self.price)}**"
                     if self.price is not None
@@ -2164,6 +2213,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     "set_cards_total": self.cards_total,
                     "includes_award": self.includes_award,
                     "missing_cards": "" if self.is_complete else self.missing_cards,
+                    "additional_information": self.additional_information,
                     "price": self.price,
                     "date_time": format_sheet_datetime(),
                     "seller": interaction.user,
@@ -2362,7 +2412,11 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     required=True,
                     max_length=120,
                 )
+                self.rarity = ui.TextInput(label="Rarity", required=False, default=str(parent_view.card_rarity or "")[:40], max_length=40)
+                self.notes = ui.TextInput(label="Notes / Additional Information", required=False, default=str(parent_view.additional_information or "")[:300], max_length=300)
                 self.add_item(self.player_name)
+                self.add_item(self.rarity)
+                self.add_item(self.notes)
 
             async def on_submit(self, interaction: discord.Interaction):
                 player_name = normalize_player_name(self.player_name.value)
@@ -2371,6 +2425,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     return
 
                 self.parent_view.player_name = player_name
+                self.parent_view.card_rarity = str(self.rarity.value or "").strip().title() or None
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
                 try:
                     await interaction.response.edit_message(
                         content=self.parent_view.selected_summary(),
@@ -2483,6 +2539,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_value = metadata_guess.subset_value
                 self.card_count_value = metadata_guess.card_count
                 self.card_rarity = metadata_guess.card_rarity
+                self.additional_information = None
                 self.set_option_order = metadata_guess.set_option_order
                 self.subset_option_order = metadata_guess.subset_option_order
                 self.variant_option_order = metadata_guess.variant_option_order
@@ -2587,6 +2644,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ]
                 if self.card_rarity:
                     details.append(f"Rarity: **{self.card_rarity}**")
+                if self.additional_information:
+                    details.append(f"Notes: **{self.additional_information}**")
                 return "\n".join(details)
 
             async def on_edit_player(self, interaction: discord.Interaction):
@@ -2659,6 +2718,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     "subset": self.subset_value,
                     "card_count": self.card_count_value,
                     "card_rarity": self.card_rarity,
+                    "additional_information": self.additional_information,
                     "price": self.starting_price,
                     "starting_price": self.starting_price,
                     "bid_increment": self.bid_increment,
@@ -3059,12 +3119,175 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             lines.append("No active notifications yet.")
         return "\n".join(lines)
 
+    def _is_moderator(interaction: discord.Interaction) -> bool:
+        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+        return bool(
+            permissions
+            and (
+                getattr(permissions, "manage_guild", False)
+                or getattr(permissions, "manage_messages", False)
+                or getattr(permissions, "administrator", False)
+            )
+        )
+
+    class AddSetModal(ui.Modal, title="Add or Update Card Set"):
+        def __init__(self):
+            super().__init__()
+            self.set_name = ui.TextInput(label="Set Name", placeholder="2026-27 Topps Chrome", max_length=100)
+            self.subsets = ui.TextInput(
+                label="Subsets (one per line or comma-separated)",
+                placeholder="Base, Gold, Signatures",
+                style=discord.TextStyle.paragraph,
+                max_length=1500,
+            )
+            self.add_item(self.set_name)
+            self.add_item(self.subsets)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            if not _is_moderator(interaction):
+                await interaction.response.send_message("Only moderators can add sets.", ephemeral=True)
+                return
+            set_name = str(self.set_name.value or "").strip()
+            subset_values = [
+                value.strip()
+                for line in str(self.subsets.value or "").splitlines()
+                for value in line.split(",")
+                if value.strip()
+            ]
+            try:
+                register_custom_set(set_name, subset_values)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            db.upsert_custom_set(set_name, subset_values, interaction.user.id)
+            log_marketplace_event(db, "custom_set_upserted", user_id=interaction.user.id, details={"set_name": set_name, "subsets": subset_values})
+            await interaction.response.send_message(
+                f"Saved **{set_name}** with {len(subset_values)} subset(s). It is available immediately.",
+                ephemeral=True,
+            )
+
+    def _showcase_embed(card: dict, index: int, total: int) -> discord.Embed:
+        details = []
+        if card.get("set_name"):
+            details.append(f"Set: {card['set_name']}")
+        if card.get("additional_information"):
+            details.append(f"Notes: {card['additional_information']}")
+        embed = discord.Embed(
+            title=f"✨ {card.get('player_names') or 'Showcase Card'}"[:256],
+            description="\n".join(details) or "A favorite from this collector's collection.",
+            color=discord.Color.purple(),
+        )
+        embed.set_footer(text=f"Showcased by {card.get('owner_name') or 'Collector'} | Card {index + 1} of {total}")
+        embed.set_image(url=f"attachment://showcase_{card['id']}.png")
+        return embed
+
+    class ShowcaseDetailsModal(ui.Modal, title="Add Showcase Card"):
+        def __init__(self, owner_view):
+            super().__init__()
+            self.owner_view = owner_view
+            self.player_names = ui.TextInput(label="Player / Card Name", max_length=120)
+            self.set_name = ui.TextInput(label="Set", required=False, max_length=120)
+            self.notes = ui.TextInput(label="Notes", placeholder="Why this card is special", required=False, style=discord.TextStyle.paragraph, max_length=500)
+            self.add_item(self.player_names)
+            self.add_item(self.set_name)
+            self.add_item(self.notes)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            if len(db.get_showcase_cards(interaction.user.id)) >= 5:
+                await interaction.response.send_message("Your showcase already has 5 cards. Remove one before adding another.", ephemeral=True)
+                return
+            await interaction.response.send_message("Upload the card image in this channel within 2 minutes.", ephemeral=True)
+            try:
+                prompt = await interaction.original_response()
+            except discord.DiscordException:
+                prompt = None
+            _url, _file, image_bytes = await collect_listing_image(bot, db, interaction, prompt)
+            if not image_bytes:
+                return
+            try:
+                db.add_showcase_card(
+                    interaction.user.id,
+                    getattr(interaction.user, "display_name", None) or interaction.user.name,
+                    normalize_player_name(self.player_names.value) or str(self.player_names.value).strip(),
+                    str(self.set_name.value or "").strip(),
+                    str(self.notes.value or "").strip(),
+                    image_bytes,
+                )
+            except ValueError as exc:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
+            log_marketplace_event(db, "showcase_card_added", user_id=interaction.user.id)
+            await interaction.followup.send("Card added to your showcase.", ephemeral=True)
+
+    class ShowcaseCarouselView(ui.View):
+        def __init__(self, owner_id: int):
+            super().__init__(timeout=300)
+            self.owner_id = owner_id
+            self.cards = db.get_showcase_cards()
+            self.index = 0
+            self._sync()
+
+        def _sync(self):
+            self.cards = db.get_showcase_cards()
+            if self.cards:
+                self.index = min(self.index, len(self.cards) - 1)
+            else:
+                self.index = 0
+            for child in self.children:
+                if getattr(child, "custom_id", "") in {"showcase:prev", "showcase:next"}:
+                    child.disabled = len(self.cards) <= 1
+                if getattr(child, "custom_id", "") == "showcase:remove":
+                    child.disabled = not self.cards
+
+        def kwargs(self) -> dict:
+            self._sync()
+            if not self.cards:
+                return {"embed": discord.Embed(title="✨ Collector Showcase", description="No cards have been showcased yet.", color=discord.Color.purple())}
+            card = self.cards[self.index]
+            file = discord.File(io.BytesIO(card["image_blob"]), filename=f"showcase_{card['id']}.png")
+            return {"embed": _showcase_embed(card, self.index, len(self.cards)), "file": file}
+
+        async def _edit(self, interaction: discord.Interaction):
+            kwargs = self.kwargs()
+            attachments = [kwargs["file"]] if kwargs.get("file") else []
+            await interaction.response.edit_message(embed=kwargs["embed"], attachments=attachments, view=self)
+
+        @ui.button(label="⬅️ Previous", style=discord.ButtonStyle.secondary, custom_id="showcase:prev", row=0)
+        async def previous(self, interaction: discord.Interaction, button: ui.Button):
+            if self.cards:
+                self.index = (self.index - 1) % len(self.cards)
+            await self._edit(interaction)
+
+        @ui.button(label="Next ➡️", style=discord.ButtonStyle.secondary, custom_id="showcase:next", row=0)
+        async def next(self, interaction: discord.Interaction, button: ui.Button):
+            if self.cards:
+                self.index = (self.index + 1) % len(self.cards)
+            await self._edit(interaction)
+
+        @ui.button(label="➕ Add Mine", style=discord.ButtonStyle.green, custom_id="showcase:add", row=1)
+        async def add(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.send_modal(ShowcaseDetailsModal(self))
+
+        @ui.button(label="🗑️ Remove Mine", style=discord.ButtonStyle.red, custom_id="showcase:remove", row=1)
+        async def remove(self, interaction: discord.Interaction, button: ui.Button):
+            if not self.cards:
+                await interaction.response.send_message("There is no showcase card to remove.", ephemeral=True)
+                return
+            card = self.cards[self.index]
+            if int(card["user_id"]) != interaction.user.id and not _is_moderator(interaction):
+                await interaction.response.send_message("You can only remove your own showcase cards.", ephemeral=True)
+                return
+            db.delete_showcase_card(card["id"])
+            log_marketplace_event(db, "showcase_card_removed", user_id=interaction.user.id, details={"card_id": card["id"]})
+            await self._edit(interaction)
+
     class BotInterfaceView(ui.View):
         def __init__(self):
             super().__init__(timeout=None)
             button_order = [
                 "nba_bot:price",
                 "nba_bot:open_marketplace",
+                "nba_bot:showcase",
                 "nba_bot:notifications",
                 "nba_bot:list_player",
                 "nba_bot:list_set",
@@ -3072,6 +3295,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "nba_bot:help",
                 "nba_bot:profile",
                 "nba_bot:status",
+                "nba_bot:add_set",
             ]
             buttons = {
                 child.custom_id: child
@@ -3111,6 +3335,19 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         @ui.button(label="📊 View Status", style=discord.ButtonStyle.secondary, custom_id="nba_bot:status", row=2)
         async def status_button(self, interaction: discord.Interaction, button: ui.Button):
             await status(interaction)
+
+        @ui.button(label="✨ Showcase", style=discord.ButtonStyle.blurple, custom_id="nba_bot:showcase", row=0)
+        async def showcase_button(self, interaction: discord.Interaction, button: ui.Button):
+            view = ShowcaseCarouselView(interaction.user.id)
+            kwargs = view.kwargs()
+            await interaction.response.send_message(**kwargs, view=view, ephemeral=True)
+
+        @ui.button(label="🛠️ Add Set (Mods)", style=discord.ButtonStyle.secondary, custom_id="nba_bot:add_set", row=3)
+        async def add_set_button(self, interaction: discord.Interaction, button: ui.Button):
+            if not _is_moderator(interaction):
+                await interaction.response.send_message("Only moderators can add or update sets.", ephemeral=True)
+                return
+            await interaction.response.send_modal(AddSetModal())
 
         @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=0)
         async def notifications_button(self, interaction: discord.Interaction, button: ui.Button):

@@ -509,8 +509,10 @@ def _normalize_card_rarity(text: str) -> str | None:
         "ultimate": "Ultimate",
     }
     for alias, rarity in sorted(rarity_aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        if alias in normalized:
+        if re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", normalized):
             return rarity
+    if len(normalized) > 30:
+        return None
     ranked = [
         (rarity, SequenceMatcher(None, normalized, alias).ratio())
         for alias, rarity in rarity_aliases.items()
@@ -985,15 +987,17 @@ def extract_listing_metadata(
             guess.confidence["card_count"] = 0.82
         else:
             guess.confidence["card_count"] = 0.7 if guess.card_count_source == "bottom_pill" else 0.75
-    guess.card_rarity = _normalize_card_rarity(text)
+    # The dedicated rarity pill is much less likely to mistake ordinary card text
+    # (for example, "rare" inside another phrase) for the card's rarity.
+    guess.card_rarity = _extract_bottom_pill_rarity(image_bytes)
     if guess.card_rarity:
-        guess.card_rarity_source = "ocr_text"
-        guess.confidence["card_rarity"] = 0.65
+        guess.card_rarity_source = "bottom_pill"
+        guess.confidence["card_rarity"] = 0.8
     else:
-        guess.card_rarity = _extract_bottom_pill_rarity(image_bytes)
+        guess.card_rarity = _normalize_card_rarity(text)
         if guess.card_rarity:
-            guess.card_rarity_source = "bottom_pill"
-            guess.confidence["card_rarity"] = 0.7
+            guess.card_rarity_source = "ocr_text"
+            guess.confidence["card_rarity"] = 0.6
 
     set_rankings = _prefer_specific_set(text, _rank_set_candidates(text, get_set_names()))
     guess.set_option_order = [candidate for candidate, _ in set_rankings]

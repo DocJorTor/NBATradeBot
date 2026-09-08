@@ -190,6 +190,8 @@ def build_set_listing_embed(
     missing_cards = str(listing_data.get("missing_cards") or "").strip()
     if not complete and missing_cards:
         details.append(f"Missing Cards: {missing_cards}")
+    if listing_data.get("additional_information"):
+        details.append(f"Notes: {listing_data['additional_information']}")
     details.append(f"Listing Price: ${float(listing_data.get('price') or 0):.2f}")
     listing_time = _listing_time_text(listing_data)
     if listing_time:
@@ -265,6 +267,8 @@ def build_listing_embed(
         )
     if listing_data.get("card_rarity"):
         desc = f"{desc}\nRarity: {listing_data['card_rarity']}"
+    if listing_data.get("additional_information"):
+        desc = f"{desc}\nNotes: {listing_data['additional_information']}"
     listing_time = _listing_time_text(listing_data)
     if listing_time:
         desc = f"{desc}\n{listing_time}"

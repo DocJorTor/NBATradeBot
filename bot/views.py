@@ -192,6 +192,11 @@ def marketplace_profile_content(db: CardDatabase, user_id: int) -> str:
     ign = str(profile.get("ign") or "Not set").strip()
     payments = str(profile.get("payment_methods") or "Not set").strip()
     payment_notes = str(profile.get("payment_notes") or "Not set").strip()
+    showcase_cards = db.get_showcase_cards(user_id)
+    showcase_text = "\n".join(
+        f"• {card['player_names']}" + (f" — {card['set_name']}" if card.get("set_name") else "")
+        for card in showcase_cards
+    ) or "No showcase cards yet."
     return (
         "## 👤 My Profile\n"
         f"**Topps Collect IGN:** {ign}\n\n"
@@ -199,6 +204,7 @@ def marketplace_profile_content(db: CardDatabase, user_id: int) -> str:
         f"{payments}\n\n"
         "**Payment platform notes (public):**\n"
         f"{payment_notes}\n\n"
+        f"**Showcase ({len(showcase_cards)}/5):**\n{showcase_text}\n\n"
         "Payment account usernames are shared with a buyer only after a claim. "
         "Payment platform names and notes are public; account usernames remain private."
     )
@@ -393,6 +399,8 @@ def _card_details_block(listing_data: Dict[str, Any]) -> str:
         missing_cards = str(listing_data.get("missing_cards") or "").strip()
         if cards_owned < cards_total and missing_cards:
             details.append(f"Missing Cards: {missing_cards}")
+        if listing_data.get("additional_information"):
+            details.append(f"Notes: {listing_data['additional_information']}")
         return "\n".join(details)
     details = [
         f"Card: {listing_data.get('player_names', 'Unknown card')}",
@@ -402,6 +410,10 @@ def _card_details_block(listing_data: Dict[str, Any]) -> str:
     if subset:
         details.append(f"Subset: {subset}")
     details.append(f"Card Count: /{format_card_count(listing_data.get('card_count'))}")
+    if listing_data.get("card_rarity"):
+        details.append(f"Rarity: {listing_data['card_rarity']}")
+    if listing_data.get("additional_information"):
+        details.append(f"Notes: {listing_data['additional_information']}")
     return "\n".join(details)
 
 
@@ -1409,9 +1421,17 @@ class EditSetMissingCardsModal(ui.Modal, title="Edit Missing Cards"):
             style=discord.TextStyle.paragraph,
         )
         self.add_item(self.missing_cards)
+        self.notes = ui.TextInput(
+            label="Notes / Additional Information",
+            default=str(parent_view.additional_information or "")[:300],
+            required=False,
+            max_length=300,
+        )
+        self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction):
         self.parent_view.missing_cards = str(self.missing_cards.value or "").strip()
+        self.parent_view.additional_information = str(self.notes.value or "").strip() or None
         await interaction.response.edit_message(
             content=self.parent_view.selected_summary(),
             view=self.parent_view,
@@ -1432,6 +1452,7 @@ class EditSetListingWorkflowView(ui.View):
         self.cards_total = int(listing_data.get("set_cards_total") or listing_data.get("card_count") or 0)
         self.includes_award = bool(listing_data.get("includes_award"))
         self.missing_cards = str(listing_data.get("missing_cards") or "")
+        self.additional_information = str(listing_data.get("additional_information") or "")
         self.price = float(listing_data.get("price") or 0)
         self.payment_methods = str(
             listing_data.get("payment_methods")
@@ -1474,6 +1495,8 @@ class EditSetListingWorkflowView(ui.View):
         ]
         if not self.is_complete:
             lines.append(f"Missing Cards: **{self.missing_cards or 'Not provided'}**")
+        if self.additional_information:
+            lines.append(f"Notes: **{self.additional_information}**")
         lines.append(f"Price: **${self.price:.2f}**")
         return "\n".join(lines)
 
@@ -1519,6 +1542,7 @@ class EditSetListingWorkflowView(ui.View):
                 "set_cards_total": self.cards_total,
                 "includes_award": self.includes_award,
                 "missing_cards": "" if self.is_complete else self.missing_cards,
+                "additional_information": self.additional_information,
                 "card_rarity": self.card_rarity,
             })
             await _apply_listing_edit(
@@ -1584,6 +1608,21 @@ class EditListingDetailsModal(ui.Modal, title="Edit Listing Details"):
             )
             self.add_item(self.duration_hours)
             self.add_item(self.bid_increment)
+        else:
+            self.card_rarity = ui.TextInput(
+                label="Rarity",
+                default=str(getattr(parent_view, "card_rarity", None) or "")[:40],
+                required=False,
+                max_length=40,
+            )
+            self.additional_information = ui.TextInput(
+                label="Notes / Additional Information",
+                default=str(getattr(parent_view, "additional_information", None) or "")[:300],
+                required=False,
+                max_length=300,
+            )
+            self.add_item(self.card_rarity)
+            self.add_item(self.additional_information)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -1611,6 +1650,9 @@ class EditListingDetailsModal(ui.Modal, title="Edit Listing Details"):
         self.parent_view.player_names = player_names
         self.parent_view.price = price
         self.parent_view.payment_methods = payment_methods
+        if not self.parent_view.is_auction:
+            self.parent_view.card_rarity = str(self.card_rarity.value or "").strip().title() or None
+            self.parent_view.additional_information = str(self.additional_information.value or "").strip() or None
         if self.parent_view.is_auction:
             self.parent_view.duration_hours = duration_hours
             self.parent_view.bid_increment = bid_increment
@@ -1643,6 +1685,8 @@ class EditListingWorkflowView(ui.View):
             or db.get_seller_payment_methods(listing_data.get("seller_id"))
             or ""
         )
+        self.card_rarity = listing_data.get("card_rarity")
+        self.additional_information = listing_data.get("additional_information")
         self.set_optional = False
         self.subset_required = True
         self.set_value = listing_data.get("set_name")
@@ -1728,6 +1772,10 @@ class EditListingWorkflowView(ui.View):
             f"Price: **${float(self.price or 0):.2f}**",
             f"Payment: **{self.payment_methods or 'Not set'}**",
         ]
+        if self.card_rarity:
+            lines.append(f"Rarity: **{self.card_rarity}**")
+        if self.additional_information:
+            lines.append(f"Notes: **{self.additional_information}**")
         if self.is_auction:
             lines.extend([
                 f"Ends in: **{self.duration_hours} hour(s)**",
@@ -1778,6 +1826,8 @@ class EditListingWorkflowView(ui.View):
             if self.is_auction and _auction_has_active_bids(self.listing_data):
                 await interaction.followup.send("A bid arrived before the edit could be saved, so the auction was not changed.", ephemeral=True)
                 return
+            self.listing_data["card_rarity"] = self.card_rarity
+            self.listing_data["additional_information"] = self.additional_information
             auction_end_at = None
             if self.is_auction:
                 auction_end_at = self.original_auction_end_at
@@ -3267,6 +3317,9 @@ class ClaimedListingView(ui.View):
                     set_cards_total=self.listing_data.get("set_cards_total"),
                     includes_award=bool(self.listing_data.get("includes_award")),
                     missing_cards=self.listing_data.get("missing_cards"),
+                    additional_information=self.listing_data.get("additional_information"),
+                    buying_format="Auction" if self.listing_data.get("listing_type") == "auction" else "Fixed Price",
+                    platform="Discord",
                 )
                 sheet_synced = bool(result.get("sheet_synced", False)) if isinstance(result, dict) else True
             else:
@@ -3285,6 +3338,9 @@ class ClaimedListingView(ui.View):
                     set_cards_total=self.listing_data.get("set_cards_total"),
                     includes_award=bool(self.listing_data.get("includes_award")),
                     missing_cards=self.listing_data.get("missing_cards"),
+                    additional_information=self.listing_data.get("additional_information"),
+                    buying_format="Auction" if self.listing_data.get("listing_type") == "auction" else "Fixed Price",
+                    platform="Discord",
                 )
             transitioned = self.db.transition_marketplace_listing(
                 listing_id,

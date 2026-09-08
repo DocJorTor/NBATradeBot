@@ -83,9 +83,9 @@ class PriceSheet:
         """Get all sales from the database."""
         return self.db.get_all_sales()
 
-    def query_player(self, player_name: Optional[str] = None, set_name: Optional[str] = None, cc: Optional[int] = None, subset: Optional[str] = None, card_rarity: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def query_player(self, player_name: Optional[str] = None, set_name: Optional[str] = None, cc: Optional[int] = None, subset: Optional[str] = None, card_rarity: Optional[str] = None, additional_information: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         """Query player sales from the database."""
-        return self.db.query_player(player_name, set_name, cc, subset, limit=limit, card_rarity=card_rarity)
+        return self.db.query_player(player_name, set_name, cc, subset, limit=limit, card_rarity=card_rarity, additional_information=additional_information)
 
     def _insert_sale_row(self, payload: Dict[str, Any]) -> None:
         values = self.sheet.get_all_values()
@@ -121,6 +121,9 @@ class PriceSheet:
             "Set Cards Total": payload.get("set_cards_total", ""),
             "Includes Award": "Yes" if payload.get("includes_award") else "No",
             "Missing Cards": payload.get("missing_cards", ""),
+            "Additional Information": payload.get("additional_information", ""),
+            "Buying Format": payload.get("buying_format", ""),
+            "Platform": payload.get("platform", "Discord"),
         }
         row = [aliases.get(header, "") for header in headers]
         self.sheet.insert_row(row, index=header_index + 2)
@@ -142,6 +145,9 @@ class PriceSheet:
         set_cards_total: int = None,
         includes_award: bool = False,
         missing_cards: str = None,
+        additional_information: str = None,
+        buying_format: str = None,
+        platform: str = "Discord",
     ):
         """Add a sale to both the database and Google Sheets."""
         # Add to database
@@ -161,6 +167,9 @@ class PriceSheet:
             set_cards_total=set_cards_total,
             includes_award=includes_award,
             missing_cards=missing_cards,
+            additional_information=additional_information,
+            buying_format=buying_format,
+            platform=platform,
         )
 
         # Add to Google Sheets as backup
@@ -186,6 +195,9 @@ class PriceSheet:
             "set_cards_total": set_cards_total,
             "includes_award": includes_award,
             "missing_cards": missing_cards,
+            "additional_information": additional_information,
+            "buying_format": buying_format,
+            "platform": platform,
         }
 
         try:

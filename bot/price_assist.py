@@ -71,6 +71,7 @@ def query_price_source(
     subset: str | None = None,
     limit: int = 50,
     card_rarity: str | None = None,
+    additional_information: str | None = None,
 ) -> list[dict[str, Any]]:
     if source is None or not hasattr(source, "query_player"):
         return []
@@ -84,6 +85,7 @@ def query_price_source(
                 subset=subset,
                 limit=limit,
                 card_rarity=card_rarity,
+                additional_information=additional_information,
             )
         )
     except TypeError:
@@ -289,6 +291,12 @@ class PriceResultsView(ui.View):
                     name="Rarity",
                     value=str(latest.get("card_rarity")),
                     inline=True,
+                )
+            if latest.get("additional_information"):
+                embed.add_field(
+                    name="Notes",
+                    value=str(latest.get("additional_information"))[:1024],
+                    inline=False,
                 )
             embeds.append(embed)
         return embeds
