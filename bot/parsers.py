@@ -1,7 +1,7 @@
-from discord import ui
-
-from datetime import datetime
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+import math
+import re
+from typing import Optional
 
 
 ANY_VALUE = "ANY"
@@ -24,9 +24,14 @@ def parse_required_float(value: str, *, field_name: str) -> float:
         raise ValueError(f"{field_name} is required.")
 
     try:
-        return float(value)
+        parsed = float(value.replace("$", "").replace(",", ""))
     except ValueError as exc:
         raise ValueError(f"{field_name} must be a number.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be a finite number.")
+    if parsed > 1_000_000:
+        raise ValueError(f"{field_name} must be $1,000,000 or less.")
+    return parsed
 
 
 def normalize_player_name(value: str) -> str:
@@ -53,11 +58,31 @@ def normalize_player_name(value: str) -> str:
         "dejounte": "Dejounte",
         "lamelo": "LaMelo",
         "lonzo": "Lonzo",
+        "pj": "PJ",
+        "cj": "CJ",
+        "rj": "RJ",
+        "tj": "TJ",
+        "aj": "AJ",
+        "ii": "II",
+        "iii": "III",
+        "iv": "IV",
+        "jr": "Jr",
+        "jr.": "Jr.",
+        "sr": "Sr",
+        "sr.": "Sr.",
     }
 
     def format_piece(piece: str) -> str:
         lowered = piece.lower()
-        return known_casing.get(lowered, lowered[:1].upper() + lowered[1:])
+        if lowered in known_casing:
+            return known_casing[lowered]
+        if re.fullmatch(r"(?:[A-Za-z]\.){2,}", piece):
+            return piece.upper()
+        if any(character.isupper() for character in piece[1:]):
+            return piece
+        if lowered.startswith("mc") and len(lowered) > 2:
+            return f"Mc{lowered[2].upper()}{lowered[3:]}"
+        return lowered[:1].upper() + lowered[1:]
 
     def format_token(token: str) -> str:
         hyphen_parts = []
@@ -74,29 +99,9 @@ def normalize_player_name(value: str) -> str:
 
 def format_sheet_datetime(date_value: Optional[datetime] = None) -> str:
     """Format a transaction date string consistent with sheet sync format."""
-    date_value = date_value or datetime.utcnow()
+    date_value = date_value or datetime.now(timezone.utc)
     return f"{date_value.strftime('%B')} {date_value.day}, {date_value.year}"
 
-
-def parse_card_modal_fields(modal: ui.Modal) -> Dict[str, Any]:
-    """Parse the shared fields used by listing and transaction modals."""
-    subset = parse_optional_int(modal.subset.value, default=0, field_name="Subset")
-    card_count = parse_optional_int(modal.card_count.value, default=1, field_name="Card Count")
-    price = parse_required_float(modal.price.value, field_name="Price")
-
-    if card_count <= 0:
-        raise ValueError("Card Count must be greater than 0.")
-    if price <= 0:
-        raise ValueError("Price must be greater than 0.")
-
-
-    return {
-        "player_names": normalize_player_name(modal.player_names.value),
-        "set_name": modal.card_set.value.strip(),
-        "subset": subset,
-        "card_count": card_count,
-        "price": price,
-    }
 
 def normalize(value):
     if value in (None, "", ANY_VALUE):

@@ -16,6 +16,8 @@ from config import (
 
 TESSERACT_TIMEOUT_SECONDS = 1.2
 MAX_OCR_DIMENSION = 900
+SET_TITLE_CROP = (0.08, 0.55, 0.92, 0.78)
+SET_PROGRESS_CROP = (0.30, 0.78, 0.70, 0.88)
 VALID_CARD_COUNTS = [1, 3, 5, 10, 15, 25, 35, 50, 75, 99, 100, 250, 500]
 CARD_COUNT_SUBSET_FALLBACKS = [
     ("superfractor", 1),
@@ -25,6 +27,7 @@ CARD_COUNT_SUBSET_FALLBACKS = [
     ("orange", 25),
     ("gold", 50),
 ]
+ONE_OF_ONE_SUBSET_MARKERS = ("superfractor", "foilfractor", "platinum")
 
 
 @dataclass
@@ -42,10 +45,24 @@ class ListingMetadataGuess:
     subset_option_order: list[str] = field(default_factory=list)
     variant_option_order: list[str] = field(default_factory=list)
     confidence: dict[str, float] = field(default_factory=dict)
-    image_was_cropped: bool = False
     card_count_source: str | None = None
     card_rarity: str | None = None
     card_rarity_source: str | None = None
+
+
+@dataclass
+class SetListingMetadataGuess:
+    """OCR fields shown on a collection-set listing screenshot."""
+
+    text: str = ""
+    engine: str = "none"
+    ocr_available: bool = False
+    set_name: str | None = None
+    subset: str | None = None
+    card_rarity: str | None = None
+    cards_owned: int | None = None
+    cards_total: int | None = None
+    confidence: dict[str, float] = field(default_factory=dict)
 
 
 def _normalize(value: Any) -> str:
@@ -188,57 +205,6 @@ def _score_player_candidate(text: str, player_name: str) -> float:
     return best_score
 
 
-def crop_card_image(image_bytes: bytes | None) -> tuple[bytes | None, bool]:
-    """Crop obvious surrounding whitespace/background while preserving the card."""
-    if not image_bytes:
-        return image_bytes, False
-    try:
-        from PIL import Image, ImageChops, ImageOps, ImageStat
-    except ImportError:
-        return image_bytes, False
-
-    try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        original_w, original_h = image.size
-        if original_w < 100 or original_h < 100:
-            return image_bytes, False
-
-        border_pixels = [
-            image.getpixel((0, 0)),
-            image.getpixel((original_w - 1, 0)),
-            image.getpixel((0, original_h - 1)),
-            image.getpixel((original_w - 1, original_h - 1)),
-        ]
-        bg = tuple(int(sum(pixel[channel] for pixel in border_pixels) / len(border_pixels)) for channel in range(3))
-        background = Image.new("RGB", image.size, bg)
-        diff = ImageChops.difference(image, background).convert("L")
-        threshold = max(18, int(ImageStat.Stat(diff).mean[0] * 1.8))
-        mask = diff.point(lambda value: 255 if value > threshold else 0)
-        mask = ImageOps.expand(mask, border=6, fill=0)
-        bbox = mask.getbbox()
-        if not bbox:
-            return image_bytes, False
-
-        left, top, right, bottom = bbox
-        left = max(0, left - 8)
-        top = max(0, top - 8)
-        right = min(original_w, right + 8)
-        bottom = min(original_h, bottom + 8)
-        crop_w = right - left
-        crop_h = bottom - top
-        original_area = original_w * original_h
-        crop_area = crop_w * crop_h
-        if crop_area < original_area * 0.25 or crop_area > original_area * 0.98:
-            return image_bytes, False
-
-        cropped = image.crop((left, top, right, bottom))
-        output = io.BytesIO()
-        cropped.save(output, format="PNG", optimize=True)
-        return output.getvalue(), True
-    except Exception:
-        return image_bytes, False
-
-
 def _crop_regions_for_ocr(image):
     width, height = image.size
     regions = [
@@ -258,8 +224,28 @@ def _prepare_ocr_image(image):
     return ImageEnhance.Contrast(gray).enhance(1.8)
 
 
+def _contains_one_of_one(text: str) -> bool:
+    """Recognize a 1/1 serial, including common OCR substitutions for one."""
+    raw_text = str(text or "")
+    one_glyph = r"[1Il|]"
+    if re.search(
+        rf"(?<![A-Za-z0-9]){one_glyph}\s*[/\\]\s*{one_glyph}(?![A-Za-z0-9])",
+        raw_text,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:1|one)\s+(?:of|out\s+of)\s+(?:1|one)\b",
+            raw_text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _extract_card_count(text: str) -> int | None:
     normalized = str(text or "")
+    if _contains_one_of_one(normalized):
+        return 1
     for match in re.finditer(r"(?:/|out\s+of\s+)(\d{1,4})\b", normalized, re.IGNORECASE):
         value = int(match.group(1))
         if value > 1:
@@ -267,6 +253,162 @@ def _extract_card_count(text: str) -> int | None:
     if re.search(r"\bunlimited\b", normalized, re.IGNORECASE):
         return 999
     return None
+
+
+def _extract_set_progress(text: str) -> tuple[int | None, int | None]:
+    """Extract a collection progress pair such as `18/25` or `18 of 25`."""
+    candidates: list[tuple[int, int, int, int]] = []
+    pattern = re.compile(
+        r"(?<!\d)(\d{1,4})\s*(?:cards?\s*)?(?:/|of|out\s+of)\s*(\d{1,4})(?!\d)",
+        re.IGNORECASE,
+    )
+    raw_text = str(text or "")
+    for match in pattern.finditer(raw_text):
+        cards_owned = int(match.group(1))
+        cards_total = int(match.group(2))
+        if cards_total < 2 or cards_owned > cards_total:
+            continue
+        context = raw_text[max(0, match.start() - 32):match.end() + 32].lower()
+        context_score = sum(
+            marker in context
+            for marker in ("card", "collect", "owned", "complete", "progress", "set")
+        )
+        candidates.append((context_score, -match.start(), cards_owned, cards_total))
+    if not candidates:
+        whitespace_match = re.fullmatch(r"\D*(\d{1,4})\s+(\d{1,4})\D*", raw_text)
+        if whitespace_match:
+            cards_owned, cards_total = (int(value) for value in whitespace_match.groups())
+            if cards_total >= 2 and cards_owned <= cards_total:
+                candidates.append((0, 0, cards_owned, cards_total))
+    if not candidates:
+        return None, None
+    _score, _position, cards_owned, cards_total = max(candidates)
+    return cards_owned, cards_total
+
+
+def _extract_set_title(text: str) -> str | None:
+    """Read the pipe-separated title block above a collection progress count."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
+    progress_indexes = [
+        index for index, line in enumerate(lines)
+        if _extract_set_progress(line) != (None, None)
+    ]
+    progress_index = progress_indexes[-1] if progress_indexes else None
+    if progress_index is None:
+        return None
+
+    nearby = [line for line in lines[max(0, progress_index - 5):progress_index] if line]
+    if not nearby:
+        return None
+
+    separator_lines = [
+        line for line in nearby
+        if "|" in line or re.search(r"\s+[Il]\s+", line)
+    ]
+    if separator_lines:
+        title_lines = separator_lines[-3:]
+    else:
+        title_lines = [
+            line for line in nearby[-3:]
+            if len(re.findall(r"[A-Za-z]+", line)) >= 3
+            and not re.search(r"\b(?:claimed|unclaimed|completed?)\b", line, re.IGNORECASE)
+        ]
+        if title_lines:
+            title_lines = [max(title_lines, key=len)]
+
+    if not title_lines:
+        return None
+    title = " ".join(title_lines)
+    title = re.sub(r"\s+[Il]\s+", " | ", title)
+    title = re.sub(r"\s*\|\s*", " | ", title)
+    title = re.sub(r"\s+", " ", title).strip(" |")
+    return title[:240] or None
+
+
+def _normalize_set_title_region(text: str) -> str | None:
+    """Normalize OCR from a crop that contains only the set title block."""
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in str(text or "").splitlines()
+        if re.search(r"[A-Za-z]", line)
+    ]
+    if not lines:
+        return None
+    title = " ".join(lines[-3:])
+    title = re.sub(r"\s+[Il]\s+", " | ", title)
+    title = re.sub(r"\s*\|\s*", " | ", title)
+    title = re.sub(r"\s+", " ", title).strip(" |")
+    return title[:240] or None
+
+
+def _split_set_title_fields(
+    title: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    if not title:
+        return None, None, None
+    title = re.sub(r"[¦│]", "|", title)
+    segments = [segment.strip() for segment in title.split("|") if segment.strip()]
+    if not segments:
+        return None, None, None
+
+    trailing_rarities = (
+        "Super Iconic",
+        "Super Rare",
+        "Legendary",
+        "Uncommon",
+        "Ultimate",
+        "Common",
+        "Iconic",
+        "Rare",
+        "Epic",
+    )
+
+    def remove_trailing_rarity(value: str) -> tuple[str, str | None]:
+        for rarity in trailing_rarities:
+            match = re.search(rf"(?:^|\s){re.escape(rarity)}\s*$", value, re.IGNORECASE)
+            if match:
+                return value[:match.start()].strip(), rarity
+        return value.strip(), None
+
+    def split_series_marker(value: str) -> tuple[str, str]:
+        """Remove screenshot metadata like `Series 1`, preserving text on either side."""
+        match = re.search(r"\bseries\s+[a-z0-9-]+\b", value, re.IGNORECASE)
+        if not match:
+            return value.strip(), ""
+        return value[:match.start()].strip(), value[match.end():].strip()
+
+    if len(segments) == 1:
+        series_match = re.match(
+            r"^(.*?)\s+series\s+[a-z0-9-]+\s+(.*)$",
+            segments[0],
+            re.IGNORECASE,
+        )
+        if series_match:
+            set_name = series_match.group(1).strip()[:120]
+            subset, card_rarity = remove_trailing_rarity(series_match.group(2))
+            return set_name or None, subset[:120] or None, card_rarity
+
+    set_name, first_subset_part = split_series_marker(segments[0])
+    set_name = set_name[:120]
+    subset_parts = [first_subset_part] if first_subset_part else []
+    card_rarity = None
+    for segment in segments[1:]:
+        series_prefix, after_series = split_series_marker(segment)
+        if not series_prefix:
+            segment = after_series
+        remaining, trailing_rarity = remove_trailing_rarity(segment)
+        if trailing_rarity:
+            card_rarity = trailing_rarity
+        if remaining:
+            subset_parts.append(remaining)
+    subset = " | ".join(subset_parts)[:120] or None
+    return set_name or None, subset, card_rarity
+
+
+def _extract_set_listing_fields(
+    text: str,
+) -> tuple[str | None, str | None, str | None]:
+    return _split_set_title_fields(_extract_set_title(text))
 
 
 def _normalize_ocr_card_count(value: int) -> int | None:
@@ -329,6 +471,9 @@ def _extract_bottom_pill_count(image_bytes: bytes | None) -> int | None:
                 )
             except Exception:
                 continue
+            parsed_count = _extract_card_count(text)
+            if parsed_count is not None:
+                return parsed_count
             numbers = [int(value) for value in re.findall(r"\d{1,4}", text or "")]
             if not numbers:
                 continue
@@ -364,8 +509,10 @@ def _normalize_card_rarity(text: str) -> str | None:
         "ultimate": "Ultimate",
     }
     for alias, rarity in sorted(rarity_aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        if alias in normalized:
+        if re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", normalized):
             return rarity
+    if len(normalized) > 30:
+        return None
     ranked = [
         (rarity, SequenceMatcher(None, normalized, alias).ratio())
         for alias, rarity in rarity_aliases.items()
@@ -484,6 +631,65 @@ def _read_text_from_image(image_bytes: bytes) -> tuple[str, str, bool]:
     except Exception:
         return "", "pytesseract_failed", False
     return "\n".join(texts), "pytesseract", True
+
+
+def _read_set_text_from_image(
+    image_bytes: bytes,
+) -> tuple[str, str, str, bool]:
+    """OCR only the stable title and progress regions of a set screenshot."""
+    try:
+        from PIL import Image, ImageEnhance, ImageOps, ImageStat
+        import pytesseract
+    except ImportError:
+        return "", "", "pytesseract_unavailable", False
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return "", "", "pytesseract_failed", False
+
+    width, height = image.size
+
+    def crop_region(bounds: tuple[float, float, float, float]):
+        left, top, right, bottom = bounds
+        region = image.crop((
+            int(width * left),
+            int(height * top),
+            int(width * right),
+            int(height * bottom),
+        ))
+        gray = ImageOps.autocontrast(ImageOps.grayscale(region))
+        if ImageStat.Stat(gray).mean[0] < 128:
+            gray = ImageOps.invert(gray)
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        gray = gray.resize((gray.width * 2, gray.height * 2), resampling)
+        gray = ImageEnhance.Contrast(ImageOps.autocontrast(gray)).enhance(2.0)
+        return gray.point(lambda value: 0 if value < 115 else 255)
+
+    title_text = ""
+    progress_text = ""
+    successful_reads = 0
+    try:
+        title_text = pytesseract.image_to_string(
+            crop_region(SET_TITLE_CROP),
+            config="--psm 6",
+            timeout=TESSERACT_TIMEOUT_SECONDS,
+        ).strip()
+        successful_reads += 1
+    except Exception:
+        pass
+    try:
+        progress_text = pytesseract.image_to_string(
+            crop_region(SET_PROGRESS_CROP),
+            config="--psm 7 -c tessedit_char_whitelist=0123456789/",
+            timeout=TESSERACT_TIMEOUT_SECONDS,
+        ).strip()
+        successful_reads += 1
+    except Exception:
+        pass
+    if not successful_reads:
+        return "", "", "pytesseract_failed", False
+    return title_text, progress_text, "pytesseract_targeted", True
 
 
 def _dominant_card_color(image_bytes: bytes | None) -> tuple[str | None, float]:
@@ -611,6 +817,55 @@ def _apply_color_subset_guess(guess: ListingMetadataGuess, image_bytes: bytes | 
         guess.variant_option_order.insert(0, variant)
 
 
+def _apply_one_of_one_subset_guard(guess: ListingMetadataGuess) -> None:
+    """Replace a color-only Orange/Gold guess with a configured 1/1 parallel."""
+    if guess.card_count != 1 or not guess.set_name:
+        return
+
+    current_text = _normalize(" ".join([
+        str(guess.subset_value or ""),
+        str(guess.subset_variant or ""),
+    ]))
+    if current_text and not any(color in current_text.split() for color in ("orange", "gold")):
+        return
+
+    candidates: list[tuple[int, int, str, str | None, str]] = []
+    preferred_group = guess.subset_group
+    for group in get_subset_groups(guess.set_name):
+        variants = get_subset_variants(guess.set_name, group)
+        configured = [(None, group)] if not variants else [
+            (variant, format_subset_for_set(guess.set_name, group, variant))
+            for variant in variants
+        ]
+        for variant, final_subset in configured:
+            normalized_subset = _normalize(final_subset)
+            marker_rank = next(
+                (
+                    index for index, marker in enumerate(ONE_OF_ONE_SUBSET_MARKERS)
+                    if marker in normalized_subset
+                ),
+                None,
+            )
+            if marker_rank is None:
+                continue
+            context_rank = 0 if preferred_group and group == preferred_group else 1
+            candidates.append((context_rank, marker_rank, group, variant, final_subset))
+
+    if not candidates:
+        return
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _context_rank, _marker_rank, group, variant, final_subset = candidates[0]
+    guess.subset_group = group
+    guess.subset_variant = variant
+    guess.subset_value = final_subset
+    guess.confidence["subset_one_of_one"] = 0.86
+    if group not in guess.subset_option_order:
+        guess.subset_option_order.insert(0, group)
+    if variant and variant not in guess.variant_option_order:
+        guess.variant_option_order.insert(0, variant)
+
+
 def _apply_subset_guess(guess: ListingMetadataGuess, text: str) -> None:
     if not guess.set_name:
         return
@@ -720,22 +975,29 @@ def extract_listing_metadata(
     guess.ocr_available = available
     guess.card_count = _extract_card_count(text)
     if guess.card_count is not None:
-        guess.card_count_source = "ocr_text"
+        guess.card_count_source = "ocr_one_of_one" if guess.card_count == 1 and _contains_one_of_one(text) else "ocr_text"
     else:
         guess.card_count = _extract_bottom_pill_count(image_bytes)
         if guess.card_count is not None:
-            guess.card_count_source = "bottom_pill"
+            guess.card_count_source = "bottom_pill_one_of_one" if guess.card_count == 1 else "bottom_pill"
     if guess.card_count is not None:
-        guess.confidence["card_count"] = 0.7 if guess.card_count_source == "bottom_pill" else 0.75
-    guess.card_rarity = _normalize_card_rarity(text)
+        if guess.card_count_source == "ocr_one_of_one":
+            guess.confidence["card_count"] = 0.9
+        elif guess.card_count_source == "bottom_pill_one_of_one":
+            guess.confidence["card_count"] = 0.82
+        else:
+            guess.confidence["card_count"] = 0.7 if guess.card_count_source == "bottom_pill" else 0.75
+    # The dedicated rarity pill is much less likely to mistake ordinary card text
+    # (for example, "rare" inside another phrase) for the card's rarity.
+    guess.card_rarity = _extract_bottom_pill_rarity(image_bytes)
     if guess.card_rarity:
-        guess.card_rarity_source = "ocr_text"
-        guess.confidence["card_rarity"] = 0.65
+        guess.card_rarity_source = "bottom_pill"
+        guess.confidence["card_rarity"] = 0.8
     else:
-        guess.card_rarity = _extract_bottom_pill_rarity(image_bytes)
+        guess.card_rarity = _normalize_card_rarity(text)
         if guess.card_rarity:
-            guess.card_rarity_source = "bottom_pill"
-            guess.confidence["card_rarity"] = 0.7
+            guess.card_rarity_source = "ocr_text"
+            guess.confidence["card_rarity"] = 0.6
 
     set_rankings = _prefer_specific_set(text, _rank_set_candidates(text, get_set_names()))
     guess.set_option_order = [candidate for candidate, _ in set_rankings]
@@ -744,6 +1006,7 @@ def extract_listing_metadata(
         guess.confidence["set_name"] = score
         _apply_subset_guess(guess, text)
         _apply_color_subset_guess(guess, image_bytes)
+        _apply_one_of_one_subset_guard(guess)
 
     _apply_card_count_subset_fallback(guess, text)
 
@@ -753,4 +1016,29 @@ def extract_listing_metadata(
     elif player_score:
         guess.confidence["player_name_rejected"] = player_score
 
+    return guess
+
+
+def extract_set_listing_metadata(image_bytes: bytes | None) -> SetListingMetadataGuess:
+    """Read a set name and collection progress without adding another OCR pass."""
+    guess = SetListingMetadataGuess()
+    if not image_bytes:
+        return guess
+
+    title_text, progress_text, engine, available = _read_set_text_from_image(image_bytes)
+    guess.text = "\n".join(part for part in (title_text, progress_text) if part)
+    guess.engine = engine
+    guess.ocr_available = available
+    guess.cards_owned, guess.cards_total = _extract_set_progress(progress_text)
+    if guess.cards_owned is not None and guess.cards_total is not None:
+        guess.confidence["set_progress"] = 0.8
+
+    normalized_title = _normalize_set_title_region(title_text)
+    guess.set_name, guess.subset, guess.card_rarity = _split_set_title_fields(normalized_title)
+    if guess.set_name:
+        guess.confidence["set_name"] = 0.8
+        if guess.subset:
+            guess.confidence["subset"] = 0.8
+        if guess.card_rarity:
+            guess.confidence["card_rarity"] = 0.8
     return guess

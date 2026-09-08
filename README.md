@@ -24,28 +24,41 @@ User actions are expected to start from the persistent `NBA Bot` interface messa
 
 - **Marketplace listings**
   - Fixed-price listing flow with image upload.
+  - Complete and incomplete set listings read set, subset, rarity, and owned/total progress from collection screenshots.
+  - Set listings track award inclusion and an optional missing-card list without using individual-card Price Assist.
   - Auction listing flow with starting price, duration, and bid increment.
+  - Marketplace browsing supports player paging, price filters, fixed-price/auction filters, ending-soon auctions, refresh, and close controls.
+  - Marketplace opens on Discord listings and exposes a visible ChaseFiends switch with the available external count.
+  - A bundled, read-only ChaseFiends snapshot adds clearly attributed external listings with direct-site and information actions.
   - OCR-assisted metadata extraction from uploaded card images.
   - Set/subset/variant/card-count review before publish.
-  - Listing embeds include seller info, card metadata, price, and image.
+  - Listing embeds include seller info, card metadata, price, image, accepted payment platform names, and a localized posted timestamp.
+
+- **Marketplace profiles**
+  - The private `Account` panel stores each user's Topps Collect IGN, payment account usernames, and public payment notes.
+  - New sellers need an IGN and at least one `Platform: username` payment account.
+  - Buyers need an IGN before claiming, offering, or bidding.
+  - Public listings show platform names and payment notes; payment usernames are shared privately with the buyer after a claim.
 
 - **Claims, offers, auctions, and transactions**
   - Buyers can claim fixed-price listings or make offers.
   - Sellers can accept, counter, or decline offers.
   - Auctions support bids, bid increments, auction end time, and seller finalization.
-  - Completed marketplace deals can be recorded as transactions.
-  - Claimed listings have follow-up controls and stale-claim reminder handling.
+  - Claimed deals follow an explicit claim → buyer paid → seller transferred/completed lifecycle.
+  - Buyers, sellers, and moderators have safe void/dispute paths; auction wins can be voided without reopening the auction.
+  - Claimed listings have follow-up controls, stale-claim reminders, and moderator escalation.
 
 - **Notifications**
   - Users can create and remove alert rules.
   - Rules can match player, set, subset/variant, and card count.
-  - Matching users are DM'd when a new listing is published.
+  - Matching users receive one DM per listing, even when several rules match, with a direct listing link when available.
 
 - **Persistence and recovery**
-  - SQLite stores sales, marketplace listings, bids, notification rules, events, seller payment methods, and bot metadata.
+  - SQLite stores sales, marketplace listings, bids, notification rules, events, marketplace profiles, and bot metadata.
   - Startup restores active listings and persistent views from the database.
   - Listing images can be persisted as blobs to repair Discord CDN/attachment edge cases.
   - Optional surface channels can mirror listings and auctions outside the primary sale channel.
+  - Failed Google Sheets transaction writes are queued locally and retried on startup.
 
 ## Architecture
 
@@ -57,6 +70,7 @@ bot/
   components.py     Shared set/subset/variant/card-count dropdown builders and fallback search modals.
   actions.py        Listing image collection, listing publication, notification fanout.
   database.py       SQLite schema, migrations, marketplace persistence, notify rules, event logging.
+  marketplace.py    Provider-neutral listing domain, adapters, validation, and static external snapshot loading.
   price_assist.py   Price query helpers and paginated price result views.
   ocr.py            Image preprocessing and OCR metadata extraction.
   serializers.py    Discord embed builders and display formatting.
@@ -92,12 +106,15 @@ DISCORD_BOT_CHANNEL_ID=
 DISCORD_BOT_CHANNEL_NAME=nba-bot
 DISCORD_SALE_CHANNEL_ID=
 DISCORD_LISTING_SURFACE_CHANNEL_ID=
+DISCORD_AUCTION_CHANNEL_ID=
 DISCORD_AUCTION_SURFACE_CHANNEL_ID=
 DISCORD_MOD_CHANNEL_ID=
 
 DATABASE_PATH=cards.db
 DISABLE_SHEETS=false
 RESTORE_VISIBLE_LISTING_MESSAGES_ON_STARTUP=false
+ENABLE_CHASEFIENDS_SNAPSHOT=true
+CHASEFIENDS_SNAPSHOT_PATH=
 
 GOOGLE_SHEETS_SPREADSHEET_ID=
 GOOGLE_SHEETS_CREDENTIALS_FILE=bot/service_account.json
@@ -105,6 +122,8 @@ GOOGLE_SHEETS_CREDENTIALS_FILE=bot/service_account.json
 WEB_HOST=127.0.0.1
 WEB_PORT=8000
 ```
+
+`DISCORD_AUCTION_CHANNEL_ID` is the primary channel where auction messages are created. `DISCORD_AUCTION_SURFACE_CHANNEL_ID` is only an optional mirror; when the primary auction channel is omitted, the bot falls back to the legacy surface value and then the sale channel.
 
 ## Data Storage
 
@@ -117,9 +136,18 @@ Important tables:
 - `marketplace_bids` for offers, bids, counters, and bid state.
 - `notify_rules` for user alert filters.
 - `marketplace_events` for audit/debug telemetry.
+- `pending_sheet_sales` for durable Google Sheets retry work.
 - metadata tables for bot message IDs and persistent interface state.
 
 Google Sheets can be used as an upstream source for pricing and transaction history. When enabled, the bot syncs sheet rows into the local database on startup.
+For exact retry deduplication, include a `Source Listing ID` (or `Listing ID`) column in the Sheet; the bot also supports both `Card Count` and the legacy `Limited Edition or Unlimited` header.
+Set sales always populate the existing `Set`, `Subset`, and `Rarity` columns. To retain all set-specific analytics in Sheets, add these optional headers: `Listing Kind`, `Set Cards Owned`, `Set Cards Total`, `Includes Award`, and `Missing Cards`.
+
+## ChaseFiends Demo Snapshot
+
+The initial ChaseFiends integration is intentionally static. On startup, the bot reads `bot/data/chasefiends_nba_listings.jsonl`; it does not call ChaseFiends, run a partner sync task, or import external sales history. Set `ENABLE_CHASEFIENDS_SNAPSHOT=false` to disable the integration immediately. `CHASEFIENDS_SNAPSHOT_PATH` can point to a replacement local snapshot.
+
+External listings remain separate from Discord-owned listings, cannot be claimed or managed in Discord, and are ignored by Discord seller membership reconciliation. Marketplace browsing defaults to Discord inventory and provides a visible source-switch button; the external action panel contains only `Go to Site` and `Listing Info`.
 
 ## Discord UI Notes
 

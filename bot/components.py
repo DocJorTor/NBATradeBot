@@ -15,6 +15,8 @@ ANY_VALUE = "ANY"
 UNLIMITED_VALUE = 999
 NO_SETS_VALUE = "__no_sets__"
 NO_SUBSETS_VALUE = "__no_subsets__"
+EMPTY_VARIANT_VALUE = "__empty_variant__"
+CUSTOM_CARD_COUNT_VALUE = "__custom_card_count__"
 
 PlayerNameCallback = Callable[[discord.Interaction, str | None], Awaitable[None]]
 PlayerNameNormalizer = Callable[[str | None], str | None]
@@ -236,6 +238,18 @@ def _placeholder_option(label: str, value: str) -> discord.SelectOption:
     return discord.SelectOption(label=label[:100], value=value[:100], default=True)
 
 
+def decode_variant_value(value: str) -> str:
+    return "" if value == EMPTY_VARIANT_VALUE else value
+
+
+def _variant_option_label(variant: str) -> str:
+    return "No Prefix" if variant == "" else variant
+
+
+def _variant_option_value(variant: str) -> str:
+    return EMPTY_VARIANT_VALUE if variant == "" else variant
+
+
 def build_set_options(self):
     options = []
     if getattr(self, "set_optional", False) and _include_any_options(self):
@@ -329,8 +343,8 @@ def build_variant_options(self):
 
     return [
         discord.SelectOption(
-            label=variant[:100],
-            value=variant[:100],
+            label=_variant_option_label(variant)[:100],
+            value=_variant_option_value(variant)[:100],
             default=variant == getattr(self, "subset_variant_value", None),
         )
         for variant in variants
@@ -344,7 +358,11 @@ def build_card_count_options(
 ) -> list[discord.SelectOption]:
     card_counts = [1, 3, 5, 10, 15, 25, 35, 50, 75, 99, 100]
     cc_counts = [250, 500, 1000]
-    options = [
+    known_values = {str(value) for value in [*card_counts, *cc_counts, UNLIMITED_VALUE, ANY_VALUE]}
+    options = []
+    if selected_value is not None and str(selected_value) not in known_values:
+        options.append(make_option(f"Current CC /{selected_value}", str(selected_value), selected_value))
+    options.extend([
         *[
             make_option(str(n), str(n), selected_value)
             for n in card_counts
@@ -354,7 +372,8 @@ def build_card_count_options(
             for n in cc_counts
         ],
         make_option("Unlimited", str(UNLIMITED_VALUE), selected_value),
-    ]
+        make_option("Custom CC...", CUSTOM_CARD_COUNT_VALUE, selected_value),
+    ])
     if include_any:
         options.insert(0, make_option("Any Card Count", ANY_VALUE, selected_value))
     return options
@@ -362,6 +381,9 @@ def build_card_count_options(
 
 async def on_card_count_select(self, interaction: discord.Interaction):
     val = self.card_count_select.values[0]
+    if val == CUSTOM_CARD_COUNT_VALUE:
+        await interaction.response.send_modal(CardCountPromptModal(self))
+        return
     if val == str(UNLIMITED_VALUE):
         self.card_count_value = UNLIMITED_VALUE
     elif val == ANY_VALUE:
@@ -371,15 +393,53 @@ async def on_card_count_select(self, interaction: discord.Interaction):
     for option in self.card_count_select.options:
         if option.value == ANY_VALUE:
             option.default = self.card_count_value is None
-        elif option.value == str(UNLIMITED_VALUE):
-            option.default = self.card_count_value == UNLIMITED_VALUE
         else:
-            option.default = self.card_count_value == int(option.value)
+            # The menu also contains the non-numeric custom-value sentinel.
+            # Compare normalized strings so refreshing a preset selection does
+            # not try to parse that sentinel as an integer.
+            option.default = str(self.card_count_value) == option.value
     summary = getattr(self, "selected_summary", None)
     if callable(summary):
         await interaction.response.edit_message(content=summary(), view=self)
     else:
         await interaction.response.edit_message(view=self)
+
+
+class CardCountPromptModal(discord.ui.Modal, title="Custom Card Count"):
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        current = getattr(parent_view, "card_count_value", None)
+        self.card_count = discord.ui.TextInput(
+            label="Card Count (CC)",
+            placeholder="Enter any positive number, e.g. 125",
+            default="" if current in (None, UNLIMITED_VALUE) else str(current),
+            required=True,
+            max_length=7,
+        )
+        self.add_item(self.card_count)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = int(str(self.card_count.value).strip().lstrip("/"))
+            if value <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            await interaction.response.send_message("Card count must be a positive whole number.", ephemeral=True)
+            return
+        self.parent_view.card_count_value = value
+        if hasattr(self.parent_view, "sync_filter_items"):
+            self.parent_view.sync_filter_items()
+        elif hasattr(self.parent_view, "card_count_select"):
+            self.parent_view.card_count_select.options = build_card_count_options(
+                selected_value=str(value),
+                include_any=getattr(self.parent_view, "include_any_options", True),
+            )
+        summary = getattr(self.parent_view, "selected_summary", None)
+        await interaction.response.edit_message(
+            content=summary() if callable(summary) else None,
+            view=self.parent_view,
+        )
 
 
 async def on_set_select(self, interaction: discord.Interaction, required: bool):
@@ -446,7 +506,7 @@ async def on_subset_select(self, interaction: discord.Interaction):
 
 
 async def on_variant_select(self, interaction: discord.Interaction):
-    self.subset_variant_value = self.variant_select.values[0]
+    self.subset_variant_value = decode_variant_value(self.variant_select.values[0])
     self.subset_value = format_subset_for_set(
         self.set_value,
         self.subset_group_value,

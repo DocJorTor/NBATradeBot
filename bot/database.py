@@ -1,7 +1,7 @@
 """Database module for card sales and pricing data."""
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 class CardDatabase:
     """SQLite database for managing card sales and pricing data."""
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 15
 
     def __init__(self, db_path: str | Path = "cards.db"):
         self.db_path = Path(db_path)
@@ -51,6 +51,21 @@ class CardDatabase:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_date_time 
             ON card_sales(date_time)
+        """)
+        self._ensure_column("card_sales", "card_rarity", "TEXT")
+        self._ensure_column("card_sales", "source_listing_id", "INTEGER")
+        self._ensure_column("card_sales", "listing_kind", "TEXT DEFAULT 'player'")
+        self._ensure_column("card_sales", "set_cards_owned", "INTEGER")
+        self._ensure_column("card_sales", "set_cards_total", "INTEGER")
+        self._ensure_column("card_sales", "includes_award", "INTEGER DEFAULT 0")
+        self._ensure_column("card_sales", "missing_cards", "TEXT")
+        self._ensure_column("card_sales", "additional_information", "TEXT")
+        self._ensure_column("card_sales", "buying_format", "TEXT")
+        self._ensure_column("card_sales", "platform", "TEXT")
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_card_sales_source_listing
+            ON card_sales(source_listing_id)
+            WHERE source_listing_id IS NOT NULL
         """)
 
         # Metadata table
@@ -122,6 +137,15 @@ class CardDatabase:
         self._ensure_column("marketplace_listings", "deal_thread_parent_channel_id", "INTEGER")
         self._ensure_column("marketplace_listings", "deal_thread_action_channel_id", "INTEGER")
         self._ensure_column("marketplace_listings", "deal_thread_action_message_id", "INTEGER")
+        self._ensure_column("marketplace_listings", "claimed_at", "TEXT")
+        self._ensure_column("marketplace_listings", "resolution_reason", "TEXT")
+        self._ensure_column("marketplace_listings", "deal_status", "TEXT")
+        self._ensure_column("marketplace_listings", "listing_kind", "TEXT DEFAULT 'player'")
+        self._ensure_column("marketplace_listings", "set_cards_owned", "INTEGER")
+        self._ensure_column("marketplace_listings", "set_cards_total", "INTEGER")
+        self._ensure_column("marketplace_listings", "includes_award", "INTEGER DEFAULT 0")
+        self._ensure_column("marketplace_listings", "missing_cards", "TEXT")
+        self._ensure_column("marketplace_listings", "additional_information", "TEXT")
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_marketplace_listings_status
             ON marketplace_listings(status)
@@ -188,11 +212,52 @@ class CardDatabase:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS seller_profiles (
                 user_id INTEGER PRIMARY KEY,
+                ign TEXT,
                 payment_methods TEXT,
+                payment_notes TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
+        self._ensure_column("seller_profiles", "ign", "TEXT")
+        self._ensure_column("seller_profiles", "payment_notes", "TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_sheet_sales (
+                listing_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS custom_card_sets (
+                set_name TEXT PRIMARY KEY COLLATE NOCASE,
+                subsets TEXT NOT NULL,
+                added_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS showcase_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                owner_name TEXT,
+                player_names TEXT NOT NULL,
+                set_name TEXT,
+                additional_information TEXT,
+                image_blob BLOB NOT NULL,
+                image_filename TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_showcase_cards_user ON showcase_cards(user_id)")
 
         # Check schema version
         cursor.execute("SELECT value FROM metadata WHERE key = 'schema_version'")
@@ -236,6 +301,92 @@ class CardDatabase:
         )
         self.conn.commit()
 
+    def upsert_custom_set(self, set_name: str, subsets: list[str], added_by: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO custom_card_sets (set_name, subsets, added_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(set_name) DO UPDATE SET
+                subsets = excluded.subsets,
+                added_by = excluded.added_by,
+                updated_at = excluded.updated_at
+            """,
+            (set_name, json.dumps(subsets), int(added_by), now, now),
+        )
+        self.conn.commit()
+
+    def get_custom_sets(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM custom_card_sets ORDER BY created_at, set_name"
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["subsets"] = json.loads(item.get("subsets") or "[]")
+            except (TypeError, ValueError):
+                item["subsets"] = []
+            results.append(item)
+        return results
+
+    def add_showcase_card(
+        self,
+        user_id: int,
+        owner_name: str,
+        player_names: str,
+        set_name: str,
+        additional_information: str,
+        image_blob: bytes,
+        image_filename: str = "showcase_card.png",
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            count = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM showcase_cards WHERE user_id = ?",
+                (int(user_id),),
+            ).fetchone()["count"]
+            if count >= 5:
+                raise ValueError("A showcase can contain at most 5 cards.")
+            cursor = self.conn.execute(
+                """
+                INSERT INTO showcase_cards (
+                    user_id, owner_name, player_names, set_name,
+                    additional_information, image_blob, image_filename,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(user_id), owner_name, player_names, set_name,
+                    additional_information, sqlite3.Binary(image_blob), image_filename,
+                    now, now,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_showcase_cards(self, user_id: int | None = None) -> List[Dict[str, Any]]:
+        if user_id is None:
+            rows = self.conn.execute(
+                "SELECT * FROM showcase_cards ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM showcase_cards WHERE user_id = ? ORDER BY created_at DESC, id DESC",
+                (int(user_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_showcase_card(self, card_id: int, user_id: int | None = None) -> bool:
+        if user_id is None:
+            cursor = self.conn.execute("DELETE FROM showcase_cards WHERE id = ?", (int(card_id),))
+        else:
+            cursor = self.conn.execute(
+                "DELETE FROM showcase_cards WHERE id = ? AND user_id = ?",
+                (int(card_id), int(user_id)),
+            )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     @staticmethod
     def _coerce_card_count(value: Any) -> Any:
         if value in (None, ""):
@@ -253,7 +404,9 @@ class CardDatabase:
         if not message_id or not channel_id:
             return
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        created_at = listing_data.get("created_at") or now
+        listing_data.setdefault("created_at", created_at)
         seller = listing_data.get("seller")
         buyer = listing_data.get("buyer")
         cursor = self.conn.cursor()
@@ -267,10 +420,13 @@ class CardDatabase:
                 buyer_id, buyer_name, status, payment_methods, image_url,
                 surface_image_url, image_blob, image_filename, image_content_type,
                 listing_type, auction_end_at, bid_increment, starting_price, claim_price,
+                claimed_at, resolution_reason, deal_status,
+                listing_kind, set_cards_owned, set_cards_total, includes_award, missing_cards,
+                additional_information,
                 deal_thread_id, deal_thread_parent_channel_id,
                 deal_thread_action_channel_id, deal_thread_action_message_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(message_id) DO UPDATE SET
                 channel_id = excluded.channel_id,
                 guild_id = excluded.guild_id,
@@ -299,6 +455,15 @@ class CardDatabase:
                 bid_increment = excluded.bid_increment,
                 starting_price = excluded.starting_price,
                 claim_price = excluded.claim_price,
+                claimed_at = excluded.claimed_at,
+                resolution_reason = excluded.resolution_reason,
+                deal_status = excluded.deal_status,
+                listing_kind = excluded.listing_kind,
+                set_cards_owned = excluded.set_cards_owned,
+                set_cards_total = excluded.set_cards_total,
+                includes_award = excluded.includes_award,
+                missing_cards = excluded.missing_cards,
+                additional_information = excluded.additional_information,
                 deal_thread_id = COALESCE(excluded.deal_thread_id, marketplace_listings.deal_thread_id),
                 deal_thread_parent_channel_id = COALESCE(excluded.deal_thread_parent_channel_id, marketplace_listings.deal_thread_parent_channel_id),
                 deal_thread_action_channel_id = COALESCE(excluded.deal_thread_action_channel_id, marketplace_listings.deal_thread_action_channel_id),
@@ -334,30 +499,175 @@ class CardDatabase:
                 listing_data.get("bid_increment"),
                 listing_data.get("starting_price", listing_data.get("price")),
                 listing_data.get("claim_price"),
+                listing_data.get("claimed_at"),
+                listing_data.get("resolution_reason"),
+                listing_data.get("deal_status"),
+                listing_data.get("listing_kind", "player"),
+                listing_data.get("set_cards_owned"),
+                listing_data.get("set_cards_total"),
+                int(bool(listing_data.get("includes_award"))),
+                listing_data.get("missing_cards"),
+                listing_data.get("additional_information"),
                 listing_data.get("deal_thread_id"),
                 listing_data.get("deal_thread_parent_channel_id"),
                 listing_data.get("deal_thread_action_channel_id"),
                 listing_data.get("deal_thread_action_message_id"),
-                now,
+                created_at,
                 now,
             ),
         )
         self.conn.commit()
 
-    def get_seller_payment_methods(self, user_id: int) -> Optional[str]:
+    def transition_marketplace_listing(
+        self,
+        message_id: int,
+        *,
+        expected_statuses: set[str] | tuple[str, ...] | list[str],
+        new_status: str,
+        buyer_id: Optional[int] = None,
+        buyer_name: Optional[str] = None,
+        price: Optional[float] = None,
+        claim_price: Optional[float] = None,
+        claimed_at: Optional[str] = None,
+        resolution_reason: Optional[str] = None,
+        deal_status: Optional[str] = None,
+        clear_buyer: bool = False,
+    ) -> bool:
+        """Atomically move a listing only if its persisted status is still expected."""
+        statuses = [str(status).lower() for status in expected_statuses]
+        if not statuses:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        updates = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [new_status, now]
+        if clear_buyer:
+            updates.extend([
+                "buyer_id = NULL",
+                "buyer_name = NULL",
+                "claim_price = NULL",
+                "claimed_at = NULL",
+                "deal_status = NULL",
+            ])
+        else:
+            if buyer_id is not None:
+                updates.append("buyer_id = ?")
+                params.append(int(buyer_id))
+            if buyer_name is not None:
+                updates.append("buyer_name = ?")
+                params.append(str(buyer_name))
+            if claim_price is not None:
+                updates.append("claim_price = ?")
+                params.append(float(claim_price))
+            if claimed_at is not None:
+                updates.append("claimed_at = ?")
+                params.append(claimed_at)
+        if price is not None:
+            updates.append("price = ?")
+            params.append(float(price))
+        if resolution_reason is not None:
+            updates.append("resolution_reason = ?")
+            params.append(str(resolution_reason))
+        if deal_status is not None:
+            updates.append("deal_status = ?")
+            params.append(str(deal_status))
+        placeholders = ", ".join("?" for _ in statuses)
+        params.extend([int(message_id), *statuses])
+        cursor = self.conn.execute(
+            f"""
+            UPDATE marketplace_listings
+            SET {', '.join(updates)}
+            WHERE message_id = ?
+              AND LOWER(status) IN ({placeholders})
+            """,
+            params,
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def transition_marketplace_deal_status(
+        self,
+        message_id: int,
+        *,
+        expected_deal_statuses: set[str] | tuple[str, ...] | list[str],
+        new_deal_status: str,
+    ) -> bool:
+        """Atomically advance a still-open claimed deal."""
+        statuses = [str(status).lower() for status in expected_deal_statuses]
+        if not statuses:
+            return False
+        placeholders = ", ".join("?" for _ in statuses)
+        cursor = self.conn.execute(
+            f"""
+            UPDATE marketplace_listings
+            SET deal_status = ?, updated_at = ?
+            WHERE message_id = ?
+              AND LOWER(status) IN ('claimed', 'pending')
+              AND LOWER(COALESCE(deal_status, 'claimed')) IN ({placeholders})
+            """,
+            (
+                str(new_deal_status),
+                datetime.now(timezone.utc).isoformat(),
+                int(message_id),
+                *statuses,
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def get_marketplace_listing_status(self, message_id: int) -> Optional[str]:
         row = self.conn.execute(
-            "SELECT payment_methods FROM seller_profiles WHERE user_id = ?",
+            "SELECT status FROM marketplace_listings WHERE message_id = ?",
+            (int(message_id),),
+        ).fetchone()
+        return str(row["status"]) if row else None
+
+    def get_marketplace_profile(self, user_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM seller_profiles WHERE user_id = ?",
             (int(user_id),),
         ).fetchone()
         if not row:
             return None
-        return row["payment_methods"]
+        return dict(row)
+
+    def upsert_marketplace_profile(
+        self,
+        user_id: int,
+        *,
+        ign: str,
+        payment_methods: str = "",
+        payment_notes: str = "",
+    ) -> None:
+        ign = str(ign or "").strip()
+        payment_methods = str(payment_methods or "").strip()
+        payment_notes = str(payment_notes or "").strip()
+        if not ign:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO seller_profiles (
+                user_id, ign, payment_methods, payment_notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                ign = excluded.ign,
+                payment_methods = excluded.payment_methods,
+                payment_notes = excluded.payment_notes,
+                updated_at = excluded.updated_at
+            """,
+            (int(user_id), ign, payment_methods, payment_notes, now, now),
+        )
+        self.conn.commit()
+
+    def get_seller_payment_methods(self, user_id: int) -> Optional[str]:
+        profile = self.get_marketplace_profile(user_id)
+        return profile.get("payment_methods") if profile else None
 
     def upsert_seller_payment_methods(self, user_id: int, payment_methods: str) -> None:
         payment_methods = str(payment_methods or "").strip()
         if not payment_methods:
             return
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
             INSERT INTO seller_profiles (
@@ -407,7 +717,7 @@ class CardDatabase:
         price: Optional[float] = None,
     ) -> None:
         cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         updates = ["status = ?", "updated_at = ?"]
         params: list[Any] = [status, now]
         if buyer_id is not None:
@@ -430,7 +740,7 @@ class CardDatabase:
         """Remove persisted private deal thread metadata for a listing."""
         if not message_id:
             return
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
             UPDATE marketplace_listings
@@ -447,7 +757,7 @@ class CardDatabase:
 
     def add_marketplace_bid(self, listing_id: int, bid: Dict[str, Any]) -> int:
         cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor.execute(
             """
             INSERT INTO marketplace_bids (
@@ -491,7 +801,7 @@ class CardDatabase:
         if not updates:
             return
         updates.append("updated_at = ?")
-        params.append(datetime.utcnow().isoformat())
+        params.append(datetime.now(timezone.utc).isoformat())
         params.append(bid_id)
         self.conn.execute(
             f"UPDATE marketplace_bids SET {', '.join(updates)} WHERE id = ?",
@@ -500,7 +810,7 @@ class CardDatabase:
         self.conn.commit()
 
     def supersede_other_marketplace_bids(self, listing_id: int, winning_bid_id: int) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
             UPDATE marketplace_bids
@@ -525,7 +835,7 @@ class CardDatabase:
 
     def add_notify_rule(self, rule: Dict[str, Any]) -> int:
         cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor.execute(
             """
             INSERT INTO notify_rules (
@@ -559,7 +869,7 @@ class CardDatabase:
 
     def deactivate_notify_rule(self, rule_id: int, user_id: int) -> bool:
         """Soft-delete one active notification rule owned by a user."""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = self.conn.execute(
             """
             UPDATE notify_rules
@@ -582,8 +892,14 @@ class CardDatabase:
         listings = []
         for row in listing_rows:
             listing = dict(row)
+            profile = self.get_marketplace_profile(listing.get("seller_id")) or {}
+            if profile.get("payment_methods"):
+                listing["payment_methods"] = profile["payment_methods"]
+            listing["payment_notes"] = profile.get("payment_notes")
             listing["image_bytes"] = listing.get("image_blob")
             listing["card_count"] = self._coerce_card_count(listing.get("card_count"))
+            listing["listing_kind"] = listing.get("listing_kind") or "player"
+            listing["includes_award"] = bool(listing.get("includes_award"))
             bid_rows = self.conn.execute(
                 """
                 SELECT * FROM marketplace_bids
@@ -635,7 +951,7 @@ class CardDatabase:
     ) -> int:
         """Record a marketplace event for auditing and troubleshooting."""
         cursor = self.conn.cursor()
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         if isinstance(details, (dict, list)):
             details_text = json.dumps(details, default=str)
         elif details is None:
@@ -664,18 +980,31 @@ class CardDatabase:
         card_count: int,
         seller_id: Optional[int] = None,
         image_url: str = None,
+        card_rarity: str = None,
+        source_listing_id: int = None,
+        listing_kind: str = "player",
+        set_cards_owned: int = None,
+        set_cards_total: int = None,
+        includes_award: bool = False,
+        missing_cards: str = None,
+        additional_information: str = None,
+        buying_format: str = None,
+        platform: str = None,
     ) -> int:
         """Add a new card sale record."""
         cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         cursor.execute(
             """
-            INSERT INTO card_sales (
+            INSERT OR IGNORE INTO card_sales (
                 player_names, set_name, subset,
                 date_time, price, card_count, seller_id,
-                image_url, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                image_url, card_rarity, source_listing_id,
+                listing_kind, set_cards_owned, set_cards_total, includes_award, missing_cards,
+                additional_information, buying_format, platform,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 player_names,
@@ -686,12 +1015,30 @@ class CardDatabase:
                 card_count,
                 seller_id,
                 image_url,
+                card_rarity,
+                source_listing_id,
+                listing_kind,
+                set_cards_owned,
+                set_cards_total,
+                int(bool(includes_award)),
+                missing_cards,
+                additional_information,
+                buying_format,
+                platform,
                 now,
                 now,
             ),
         )
         self.conn.commit()
-        return cursor.lastrowid
+        if cursor.rowcount:
+            return cursor.lastrowid
+        if source_listing_id is not None:
+            row = self.conn.execute(
+                "SELECT id FROM card_sales WHERE source_listing_id = ?",
+                (int(source_listing_id),),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+        return 0
 
     def query_player(
         self,
@@ -700,6 +1047,8 @@ class CardDatabase:
         cc: Optional[int] = None,
         subset: Optional[str] = None,
         limit: int = 50,
+        card_rarity: Optional[str] = None,
+        additional_information: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Query sales, optionally filtered by player, set, subset, and card count."""
         cursor = self.conn.cursor()
@@ -707,7 +1056,7 @@ class CardDatabase:
         query = """
             SELECT *
             FROM card_sales
-            WHERE 1 = 1
+            WHERE COALESCE(listing_kind, 'player') != 'set'
         """
         params: list[Any] = []
 
@@ -729,6 +1078,14 @@ class CardDatabase:
         if cc is not None:
             query += " AND card_count = ?"
             params.append(cc)
+
+        if card_rarity:
+            query += " AND LOWER(COALESCE(card_rarity, '')) = ?"
+            params.append(str(card_rarity).strip().lower())
+
+        if additional_information:
+            query += " AND LOWER(COALESCE(additional_information, '')) LIKE ?"
+            params.append(f"%{str(additional_information).strip().lower()}%")
 
         query += """
             ORDER BY
@@ -796,7 +1153,10 @@ class CardDatabase:
             player_names = row.get("Player Name(s)", "").strip()
             set_name = row.get("Set", "")
             subset = row.get("Subset", "")
-            le_val = row.get("Limited Edition or Unlimited", "Unlimited")
+            le_val = row.get(
+                "Limited Edition or Unlimited",
+                row.get("Card Count", "Unlimited"),
+            )
             try:
                 if le_val is None:
                     card_count = 999
@@ -817,15 +1177,35 @@ class CardDatabase:
                 # Skip rows where price is not a number (e.g., contains 'trade')
                 continue
 
-            # Check if this record already exists (simple deduplication)
-            cursor.execute(
-                """
-                SELECT id FROM card_sales
-                WHERE player_names = ? AND set_name = ? AND date_time = ? AND price = ?
-                """,
-                (player_names, set_name, date_time, price),
-            )
-            if not cursor.fetchone():
+            source_listing_value = row.get("Source Listing ID") or row.get("Listing ID")
+            try:
+                source_listing_id = int(str(source_listing_value).strip()) if source_listing_value else None
+            except (TypeError, ValueError):
+                source_listing_id = None
+            listing_kind = str(row.get("Listing Kind") or "player").strip().lower()
+            try:
+                set_cards_owned = int(row.get("Set Cards Owned")) if str(row.get("Set Cards Owned") or "").strip() else None
+                set_cards_total = int(row.get("Set Cards Total")) if str(row.get("Set Cards Total") or "").strip() else None
+            except (TypeError, ValueError):
+                set_cards_owned = None
+                set_cards_total = None
+            includes_award = str(row.get("Includes Award") or "").strip().lower() in {"yes", "true", "1"}
+
+            existing = None
+            if source_listing_id is not None:
+                existing = cursor.execute(
+                    "SELECT id, source_listing_id FROM card_sales WHERE source_listing_id = ?",
+                    (source_listing_id,),
+                ).fetchone()
+            if existing is None:
+                existing = cursor.execute(
+                    """
+                    SELECT id, source_listing_id FROM card_sales
+                    WHERE player_names = ? AND set_name = ? AND date_time = ? AND price = ?
+                    """,
+                    (player_names, set_name, date_time, price),
+                ).fetchone()
+            if existing is None:
                 self.add_sale(
                     player_names=player_names,
                     set_name=set_name,
@@ -833,7 +1213,61 @@ class CardDatabase:
                     date_time=date_time,
                     price=price,
                     card_count=card_count,
+                    card_rarity=row.get("Rarity") or None,
+                    source_listing_id=source_listing_id,
+                    listing_kind=listing_kind,
+                    set_cards_owned=set_cards_owned,
+                    set_cards_total=set_cards_total,
+                    includes_award=includes_award,
+                    missing_cards=row.get("Missing Cards") or None,
+                    additional_information=row.get("Additional Information") or None,
+                    buying_format=row.get("Buying Format") or None,
+                    platform=row.get("Platform") or None,
                 )
+            elif source_listing_id is not None and existing["source_listing_id"] is None:
+                cursor.execute(
+                    "UPDATE card_sales SET source_listing_id = ? WHERE id = ?",
+                    (source_listing_id, existing["id"]),
+                )
+                self.conn.commit()
+
+    def enqueue_pending_sheet_sale(self, listing_id: int, payload: Dict[str, Any], error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO pending_sheet_sales (
+                listing_id, payload, attempts, last_error, created_at, updated_at
+            ) VALUES (?, ?, 1, ?, ?, ?)
+            ON CONFLICT(listing_id) DO UPDATE SET
+                payload = excluded.payload,
+                attempts = pending_sheet_sales.attempts + 1,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (int(listing_id), json.dumps(payload, default=str), str(error), now, now),
+        )
+        self.conn.commit()
+
+    def get_pending_sheet_sales(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM pending_sheet_sales ORDER BY created_at"
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("payload") or "{}")
+            except (TypeError, ValueError):
+                item["payload"] = {}
+            results.append(item)
+        return results
+
+    def complete_pending_sheet_sale(self, listing_id: int) -> None:
+        self.conn.execute(
+            "DELETE FROM pending_sheet_sales WHERE listing_id = ?",
+            (int(listing_id),),
+        )
+        self.conn.commit()
 
     def close(self):
         """Close the database connection."""

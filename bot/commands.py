@@ -20,34 +20,44 @@ from components import (
     build_set_options,
     build_subset_options,
     build_variant_options,
+    decode_variant_value,
     on_card_count_select,
     on_set_select,
     on_subset_select,
     on_variant_select,
 )
-from config import format_subset_for_set, has_subset_variants
+from config import format_subset_for_set, has_subset_variants, register_custom_set
 from database import CardDatabase
 from logger import LOGGER, log_marketplace_event
-from ocr import extract_listing_metadata
-from parsers import format_sheet_datetime, normalize_player_name
+from marketplace import LISTING_KIND_SET, active_marketplace_inventory
+from ocr import extract_listing_metadata, extract_set_listing_metadata
+from parsers import format_sheet_datetime, normalize_player_name, parse_required_float
 from price_assist import (
     PriceResultsView as SharedPriceResultsView,
     build_price_assist,
     query_price_source,
 )
-from serializers import build_listing_embed, format_card_count
+from serializers import format_card_count
 from sheets import PriceSheet
-from views import ClaimedListingView, ListingActionView, MarketplaceCarouselView
+from views import (
+    AuctionActionView,
+    ClaimedListingView,
+    ListingActionView,
+    MarketplaceCarouselView,
+    MarketplaceProfileModal,
+    MarketplaceProfileView,
+    marketplace_profile_content,
+    marketplace_profile_status,
+)
 ANY_VALUE = "ANY"
 BUTTON_PAD = "\u00a0"
 
 
 def _extract_listing_metadata_for_review(image_bytes: bytes | None, known_players: list[str]):
-    metadata_guess = extract_listing_metadata(
+    return extract_listing_metadata(
         image_bytes,
         known_players=known_players,
     )
-    return metadata_guess, image_bytes, False
 
 
 def _format_price(value) -> str:
@@ -79,15 +89,8 @@ def _get_active_sale_listings_for_user(bot: "NBACollectBot", user_id: int) -> li
         for listing in (getattr(bot, "active_listings", {}) or {}).values()
         if listing.get("seller_id") == user_id
         and str(listing.get("status", "active")).lower() in {"active", "open"}
-        and str(listing.get("listing_type", "sale")).lower() != "auction"
     ]
-    listings.sort(
-        key=lambda listing: (
-            str(listing.get("date_time") or ""),
-            int(listing.get("message_id") or 0),
-        ),
-        reverse=True,
-    )
+    listings.sort(key=_listing_newest_sort_key, reverse=True)
     return listings
 
 
@@ -97,15 +100,8 @@ def _get_claimed_sale_listings_for_user(bot: "NBACollectBot", user_id: int) -> l
         for listing in (getattr(bot, "active_listings", {}) or {}).values()
         if listing.get("seller_id") == user_id
         and str(listing.get("status", "active")).lower() in {"claimed", "pending"}
-        and str(listing.get("listing_type", "sale")).lower() != "auction"
     ]
-    listings.sort(
-        key=lambda listing: (
-            str(listing.get("updated_at") or listing.get("date_time") or ""),
-            int(listing.get("message_id") or 0),
-        ),
-        reverse=True,
-    )
+    listings.sort(key=_listing_activity_sort_key, reverse=True)
     return listings
 
 
@@ -140,19 +136,37 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     return parsed
 
 
-def _get_active_marketplace_listings(bot: "NBACollectBot") -> list[dict]:
-    listings = [
-        listing
-        for listing in (getattr(bot, "active_listings", {}) or {}).values()
-        if str(listing.get("status", "active")).lower() in {"active", "open"}
-    ]
-    listings.sort(
-        key=lambda listing: (
-            str(listing.get("date_time") or ""),
-            int(listing.get("message_id") or 0),
-        ),
-        reverse=True,
+def _listing_newest_sort_key(listing: dict) -> tuple[datetime, int]:
+    timestamp = (
+        _parse_iso_datetime(listing.get("created_at"))
+        or _parse_iso_datetime(listing.get("updated_at"))
     )
+    message_id = listing.get("message_id")
+    if timestamp is None and message_id:
+        try:
+            timestamp = discord.utils.snowflake_time(int(message_id))
+        except (TypeError, ValueError):
+            timestamp = None
+    return timestamp or datetime.min.replace(tzinfo=timezone.utc), int(message_id or 0)
+
+
+def _listing_activity_sort_key(listing: dict) -> tuple[datetime, int]:
+    timestamp = (
+        _parse_iso_datetime(listing.get("updated_at"))
+        or _parse_iso_datetime(listing.get("created_at"))
+    )
+    message_id = listing.get("message_id")
+    if timestamp is None and message_id:
+        try:
+            timestamp = discord.utils.snowflake_time(int(message_id))
+        except (TypeError, ValueError):
+            timestamp = None
+    return timestamp or datetime.min.replace(tzinfo=timezone.utc), int(message_id or 0)
+
+
+def _get_active_marketplace_listings(bot: "NBACollectBot") -> list[dict]:
+    listings = active_marketplace_inventory(bot)
+    listings.sort(key=_listing_newest_sort_key, reverse=True)
     return listings
 
 
@@ -449,7 +463,7 @@ class StatusListingSelectView(ui.View):
         *,
         placeholder: str = "Choose one of your active listings",
         allowed_statuses: set[str] | None = None,
-        action_view_cls=ListingActionView,
+        action_view_cls=None,
         event_type: str = "status_listing_actions_opened",
         stale_message: str = "That listing is no longer active.",
     ):
@@ -461,11 +475,26 @@ class StatusListingSelectView(ui.View):
         self.action_view_cls = action_view_cls
         self.event_type = event_type
         self.stale_message = stale_message
-        self.listings_by_id = {
-            str(listing.get("message_id")): listing
-            for listing in listings[:25]
-            if listing.get("message_id")
-        }
+        self.listings = [listing for listing in listings if listing.get("message_id")]
+        self.page = 0
+        self.listings_by_id = {}
+        self.select = ui.Select(placeholder=placeholder, min_values=1, max_values=1)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+        self.previous_button = ui.Button(label="⬅️ Previous", style=discord.ButtonStyle.secondary, row=1)
+        self.previous_button.callback = self.on_previous
+        self.add_item(self.previous_button)
+        self.next_button = ui.Button(label="Next ➡️", style=discord.ButtonStyle.secondary, row=1)
+        self.next_button.callback = self.on_next
+        self.add_item(self.next_button)
+        self._sync_page()
+
+    def _sync_page(self) -> None:
+        page_count = max(1, (len(self.listings) + 24) // 25)
+        self.page = min(self.page, page_count - 1)
+        start = self.page * 25
+        page_listings = self.listings[start:start + 25]
+        self.listings_by_id = {str(listing["message_id"]): listing for listing in page_listings}
         options = []
         for listing_id, listing in self.listings_by_id.items():
             player = str(listing.get("player_names") or "Unknown Player")
@@ -479,14 +508,24 @@ class StatusListingSelectView(ui.View):
                 )
             )
 
-        self.select = ui.Select(
-            placeholder=placeholder,
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-        self.select.callback = self.on_select
-        self.add_item(self.select)
+        self.select.options = options
+        self.select.placeholder = f"Page {self.page + 1}/{page_count}: choose a listing"
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= page_count - 1
+
+    async def on_previous(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        self._sync_page()
+        await interaction.response.edit_message(view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if await self._reject_wrong_user(interaction):
+            return
+        self.page += 1
+        self._sync_page()
+        await interaction.response.edit_message(view=self)
 
     async def _reject_wrong_user(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -518,9 +557,12 @@ class StatusListingSelectView(ui.View):
             details={"player_names": listing.get("player_names")},
         )
         kwargs = await self.bot.build_listing_message_kwargs(listing)
+        action_view_cls = self.action_view_cls
+        if action_view_cls is None:
+            action_view_cls = AuctionActionView if listing.get("listing_type") == "auction" else ListingActionView
         await interaction.followup.send(
             **kwargs,
-            view=self.action_view_cls(self.bot, self.db, listing),
+            view=action_view_cls(self.bot, self.db, listing),
             ephemeral=True,
         )
 
@@ -546,7 +588,7 @@ class StatusActionsView(ui.View):
         interaction: discord.Interaction,
         listing: dict,
         *,
-        action_view_cls=ListingActionView,
+        action_view_cls=None,
         event_type: str = "status_listing_actions_opened",
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -558,13 +600,15 @@ class StatusActionsView(ui.View):
             details={"player_names": listing.get("player_names")},
         )
         kwargs = await self.bot.build_listing_message_kwargs(listing)
+        if action_view_cls is None:
+            action_view_cls = AuctionActionView if listing.get("listing_type") == "auction" else ListingActionView
         await interaction.followup.send(
             **kwargs,
             view=action_view_cls(self.bot, self.db, listing),
             ephemeral=True,
         )
 
-    @ui.button(label="📝 Listing Actions", style=discord.ButtonStyle.blurple, custom_id="status:listing_actions")
+    @ui.button(label="📝 Active Listing / Auction Actions", style=discord.ButtonStyle.blurple, custom_id="status:listing_actions")
     async def listing_actions_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -572,7 +616,7 @@ class StatusActionsView(ui.View):
         listings = _get_active_sale_listings_for_user(self.bot, self.owner_id)
         if not listings:
             await interaction.response.send_message(
-                "You do not have any active fixed-price listings right now.",
+                "You do not have any active listings or auctions right now.",
                 ephemeral=True,
             )
             return
@@ -581,16 +625,13 @@ class StatusActionsView(ui.View):
             await self._send_listing_actions(interaction, listings[0])
             return
 
-        extra = ""
-        if len(listings) > 25:
-            extra = "\nShowing the first 25 active listings."
         await interaction.response.send_message(
-            f"Choose a listing to manage.{extra}",
+            "Choose a listing or auction to manage.",
             view=StatusListingSelectView(self.bot, self.db, self.owner_id, listings),
             ephemeral=True,
         )
 
-    @ui.button(label="✅ Claimed Listing Actions", style=discord.ButtonStyle.green, custom_id="status:claimed_listing_actions")
+    @ui.button(label="✅ Claimed / Won Deal Actions", style=discord.ButtonStyle.green, custom_id="status:claimed_listing_actions")
     async def claimed_listing_actions_button(self, interaction: discord.Interaction, button: ui.Button):
         if await self._reject_wrong_user(interaction):
             return
@@ -598,7 +639,7 @@ class StatusActionsView(ui.View):
         listings = _get_claimed_sale_listings_for_user(self.bot, self.owner_id)
         if not listings:
             await interaction.response.send_message(
-                "You do not have any claimed fixed-price listings right now.",
+                "You do not have any claimed listings or auction wins right now.",
                 ephemeral=True,
             )
             return
@@ -612,11 +653,8 @@ class StatusActionsView(ui.View):
             )
             return
 
-        extra = ""
-        if len(listings) > 25:
-            extra = "\nShowing the first 25 claimed listings."
         await interaction.response.send_message(
-            f"Choose a claimed listing to manage.{extra}",
+            "Choose a claimed listing or auction win to manage.",
             view=StatusListingSelectView(
                 self.bot,
                 self.db,
@@ -632,6 +670,12 @@ class StatusActionsView(ui.View):
         )
 
 def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardDatabase) -> None:
+    for stored_set in db.get_custom_sets():
+        try:
+            register_custom_set(stored_set["set_name"], stored_set["subsets"])
+        except ValueError:
+            LOGGER.warning("Ignored invalid stored custom set %r", stored_set.get("set_name"))
+
     async def help_command(interaction: discord.Interaction):
 
         embed = discord.Embed(
@@ -642,23 +686,35 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "Search recent card sales. You can leave the player blank, then filter by set, subset, and card count.\n\n"
                 "`🔔 Notifications`\n"
                 "View your active alerts, then use `🔔 Add Notification` or `🔕 Remove Notification`.\n\n"
-                "`🏷️ List Player`\n"
+                "`🏷️ List a Player`\n"
                 "Create a fixed-price card listing with image upload.\n\n"
-                "`🔨 Auction Player`\n"
+                "`📚 List a Set`\n"
+                "Create a fixed-price complete or incomplete set listing from a collection screenshot.\n\n"
+                "`🔨 Auction a Player`\n"
                 "Create a timed auction with image upload.\n\n"
                 "`🛒 Marketplace`\n"
                 "Browse active marketplace listings in one carousel. Claim listings, make offers, bid on auctions, and record transactions.\n\n"
+                "`✨ Showcase`\n"
+                "Browse members' favorite cards, or add up to five cards to your own showcase.\n\n"
                 "`📊 View Status`\n"
                 "View your active listings, offers, auction bids, claims, and notifications. This response is private.\n\n"
+                "`👤 Account`\n"
+                "Set your Topps Collect IGN, private payment account usernames, and public payment notes. The profile panel itself is private.\n\n"
+                "`🛠️ Add Set (Mods)`\n"
+                "Moderators can add or update sets and subsets without changing bot code.\n\n"
                 "`💬 Leave Feedback`\n"
-                "Report missing sets, subsets, players, bugs, or general feedback."
+                "Use the button below to report missing sets, subsets, players, bugs, disputes, or general feedback."
             ),
             color=discord.Color.orange(),
         )
 
         embed.set_footer(text="Built to help!")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed,
+            view=HelpView(),
+            ephemeral=True,
+        )
 
     async def feedback(interaction: discord.Interaction):
         categories = {
@@ -685,6 +741,12 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "modal_title": "Report Bug",
                 "subject_label": "What broke?",
                 "subject_placeholder": "Price lookup returned no results",
+            },
+            "deal_dispute": {
+                "label": "Deal / Payment Dispute",
+                "modal_title": "Report Deal Dispute",
+                "subject_label": "Listing or user",
+                "subject_placeholder": "Card name, listing link, or Discord user",
             },
             "general": {
                 "label": "General Feedback",
@@ -781,6 +843,23 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             ephemeral=True,
         )
 
+    class HelpView(ui.View):
+        def __init__(self):
+            super().__init__(timeout=180)
+
+        @ui.button(
+            label="💬 Leave Feedback",
+            style=discord.ButtonStyle.blurple,
+            custom_id="help:leave_feedback",
+            row=4,
+        )
+        async def leave_feedback_button(
+            self,
+            interaction: discord.Interaction,
+            button: ui.Button,
+        ):
+            await feedback(interaction)
+
     async def remove_notify(interaction: discord.Interaction):
         user_id = interaction.user.id
         notify_rules = [
@@ -799,24 +878,14 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         class RemoveNotifyView(ui.View):
             def __init__(self, rules: list[dict]):
                 super().__init__(timeout=120)
-                self.rules_by_id = {str(rule["id"]): rule for rule in rules[:25]}
+                self.rules = rules
+                self.page = 0
+                self.rules_by_id = {}
                 self.pending_rule_id = None
-                options = []
-                for rule_id, rule in self.rules_by_id.items():
-                    label, description = _notify_rule_option_text(rule)
-                    options.append(
-                        discord.SelectOption(
-                            label=label,
-                            description=description,
-                            value=rule_id,
-                        )
-                    )
-
                 self.select = ui.Select(
                     placeholder="Choose a notification to remove",
                     min_values=1,
                     max_values=1,
-                    options=options,
                 )
                 self.select.callback = self.on_select
                 self.add_item(self.select)
@@ -837,6 +906,44 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 )
                 self.cancel_button.callback = self.on_cancel
                 self.add_item(self.cancel_button)
+                self.previous_button = ui.Button(label="⬅️ Previous", style=discord.ButtonStyle.secondary, row=2)
+                self.previous_button.callback = self.on_previous
+                self.add_item(self.previous_button)
+                self.next_button = ui.Button(label="Next ➡️", style=discord.ButtonStyle.secondary, row=2)
+                self.next_button.callback = self.on_next
+                self.add_item(self.next_button)
+                self._sync_page()
+
+            def _sync_page(self) -> None:
+                page_count = max(1, (len(self.rules) + 24) // 25)
+                self.page = min(self.page, page_count - 1)
+                page_rules = self.rules[self.page * 25:self.page * 25 + 25]
+                self.rules_by_id = {str(rule["id"]): rule for rule in page_rules}
+                self.select.options = []
+                for rule_id, rule in self.rules_by_id.items():
+                    label, description = _notify_rule_option_text(rule)
+                    self.select.options.append(discord.SelectOption(label=label, description=description, value=rule_id))
+                self.select.placeholder = f"Page {self.page + 1}/{page_count}: choose an alert"
+                self.previous_button.disabled = self.page <= 0
+                self.next_button.disabled = self.page >= page_count - 1
+
+            async def on_previous(self, interaction: discord.Interaction):
+                if await self._reject_wrong_user(interaction):
+                    return
+                self.page = max(0, self.page - 1)
+                self.pending_rule_id = None
+                self.confirm_button.disabled = True
+                self._sync_page()
+                await interaction.response.edit_message(content="Choose a notification to remove.", view=self)
+
+            async def on_next(self, interaction: discord.Interaction):
+                if await self._reject_wrong_user(interaction):
+                    return
+                self.page += 1
+                self.pending_rule_id = None
+                self.confirm_button.disabled = True
+                self._sync_page()
+                await interaction.response.edit_message(content="Choose a notification to remove.", view=self)
 
             async def _reject_wrong_user(self, select_interaction: discord.Interaction) -> bool:
                 if select_interaction.user.id == user_id:
@@ -927,12 +1034,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 )
                 self.stop()
 
-        extra = ""
-        if len(notify_rules) > 25:
-            extra = "\nShowing the first 25 active notifications."
-
         await interaction.response.send_message(
-            f"Choose a notification to remove.{extra}",
+            "Choose a notification to remove.",
             view=RemoveNotifyView(notify_rules),
             ephemeral=True,
         )
@@ -955,7 +1058,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         )
 
         embed.add_field(
-            name="🤝 Marketplace Trust",
+            name="🤝 Marketplace History",
             value=(
                 f"Listings sold: **{trust_stats['listings_sold']}**\n"
                 f"Listings bought: **{trust_stats['listings_bought']}**"
@@ -1018,6 +1121,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_variant_value = None
                 self.subset_value = None
                 self.card_count_value = None
+                self.additional_information = None
                 self.sync_filter_items()
 
             def _variant_required(self) -> bool:
@@ -1081,7 +1185,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.submit_button.callback = self.on_submit
                 self.add_item(self.submit_button)
                 self.player_button = ui.Button(
-                    label="🔍 Select Player",
+                    label="🔍 Player / Notes",
                     style=discord.ButtonStyle.blurple,
                     row=4,
                 )
@@ -1116,18 +1220,25 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     f"Player: `{player_display}`\n"
                     f"Set: `{set_display}`\n"
                     f"Subset: `{subset_display}`\n"
-                    f"Card Count: `{card_count_display}`"
+                    f"Card Count: `{card_count_display}`\n"
+                    f"Notes: `{self.additional_information or 'Any Notes'}`"
                 )
 
             async def on_player_name(self, interaction: discord.Interaction):
-                await interaction.response.send_modal(
-                    PlayerNamePromptModal(
-                        "Search Player",
-                        self.on_player_name_submit,
-                        normalizer=normalize_player_name,
-                        initial_value=self.player_name,
-                    )
-                )
+                parent_view = self
+                class PriceTextModal(ui.Modal, title="Price Search Text"):
+                    def __init__(self):
+                        super().__init__()
+                        self.player = ui.TextInput(label="Player Name", required=False, default=str(parent_view.player_name or "")[:120], max_length=120)
+                        self.notes = ui.TextInput(label="Notes / Additional Information", placeholder="Debut, career high, ROTY, award...", required=False, default=str(parent_view.additional_information or "")[:200], max_length=200)
+                        self.add_item(self.player)
+                        self.add_item(self.notes)
+                    async def on_submit(self, modal_interaction: discord.Interaction):
+                        parent_view.player_name = normalize_player_name(self.player.value)
+                        parent_view.additional_information = str(self.notes.value or "").strip() or None
+                        parent_view.sync_filter_items()
+                        await modal_interaction.response.edit_message(content=parent_view.selected_summary(), view=parent_view)
+                await interaction.response.send_modal(PriceTextModal())
 
             async def on_player_name_submit(self, interaction: discord.Interaction, player_name: str | None):
                 self.player_name = player_name
@@ -1141,6 +1252,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_variant_value = None
                 self.subset_value = None
                 self.card_count_value = None
+                self.additional_information = None
                 self.set_option_order = None
                 self.subset_option_order = None
                 self.variant_option_order = None
@@ -1175,7 +1287,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_variant_select(self, interaction: discord.Interaction):
-                selected = self.variant_select.values[0]
+                selected = decode_variant_value(self.variant_select.values[0])
                 if selected in {"select_subset_first", "no_variants"}:
                     await interaction.response.edit_message(content=self.selected_summary(), view=self)
                     return
@@ -1200,6 +1312,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     set_name=set_name,
                     cc=cc,
                     subset=subset,
+                    additional_information=self.additional_information,
                 )
                 log_marketplace_event(
                     db,
@@ -1210,6 +1323,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                         "set_name": set_name,
                         "subset": subset,
                         "card_count": cc,
+                        "additional_information": self.additional_information,
                         "result_count": len(results),
                     },
                     level=20,
@@ -1224,6 +1338,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                             "set_name": set_name,
                             "subset": subset,
                             "card_count": cc,
+                            "additional_information": self.additional_information,
                         },
                         level=20,
                     )
@@ -1267,6 +1382,26 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
 
 
     async def list_a_player(interaction: discord.Interaction):
+        profile_ready, _profile = marketplace_profile_status(
+            db,
+            interaction.user.id,
+            require_payments=True,
+        )
+        if not profile_ready:
+            async def resume_listing(profile_interaction: discord.Interaction) -> None:
+                await list_a_player(profile_interaction)
+
+            await interaction.response.send_modal(
+                MarketplaceProfileModal(
+                    db,
+                    interaction.user.id,
+                    bot=bot,
+                    require_payments=True,
+                    after_save=resume_listing,
+                )
+            )
+            return
+
         upload_sessions = getattr(bot, "listing_upload_sessions", None)
         if upload_sessions is None:
             upload_sessions = set()
@@ -1350,75 +1485,48 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 },
             )
 
-        class ListingPriceAssistView(ui.View):
-            def __init__(self, price_assist: dict, owner_id: int):
-                super().__init__(timeout=180)
-                self.price_assist = price_assist
-                self.owner_id = owner_id
-
-                button = ui.Button(
-                    label="💡 Price Assist",
-                    style=discord.ButtonStyle.secondary,
-                )
-                button.callback = self.on_view_prices
-                self.add_item(button)
-
-            async def on_view_prices(self, interaction: discord.Interaction):
-                if interaction.user.id != self.owner_id:
-                    await interaction.response.send_message(
-                        "Only the listing creator can open this price assist.",
-                        ephemeral=True,
-                    )
-                    return
-
-                results = self.price_assist.get("results") or []
-                if not results:
-                    await interaction.response.send_message(
-                        "Sorry, there were no similar matches found for this card",
-                        ephemeral=True,
-                    )
-                    return
-
-                result_view = SharedPriceResultsView(
-                    results,
-                    interaction.user.id,
-                    self.price_assist.get("results_heading") or "Recent price results",
-                    self.price_assist.get("range_label"),
-                )
-                paginated_view = result_view if len(results) > result_view.page_size else None
-                send_kwargs = {
-                    "content": result_view.content(),
-                    "embeds": result_view.embeds(),
-                    "ephemeral": True,
-                }
-                if paginated_view is not None:
-                    send_kwargs["view"] = paginated_view
-                await interaction.response.send_message(**send_kwargs)
-
         async def send_listing_price_assist(interaction: discord.Interaction, view: ui.View) -> None:
             price_assist = build_listing_price_assist(view)
             if not price_assist:
+                message = (
+                    "Price Assist needs the player, set, subset, and card count. "
+                    "Enter the player with Player & Price and choose the current dropdown values first; "
+                    "a listing price is not required."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
                 return
 
-            assist_view = (
-                ListingPriceAssistView(price_assist, interaction.user.id)
-                if price_assist.get("results")
-                else None
-            )
-            content = (
-                "**Price Assist**"
-                if price_assist.get("results")
-                else f"**Price Assist**\n{price_assist['field_value']}"
+            results = price_assist.get("results") or []
+            if not results:
+                message = f"**Price Assist**\n{price_assist['field_value']}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+                return
+
+            result_view = SharedPriceResultsView(
+                results,
+                interaction.user.id,
+                price_assist.get("results_heading") or "Recent price results",
+                price_assist.get("range_label"),
             )
             send_kwargs = {
-                "content": content,
+                "content": result_view.content(),
+                "embeds": result_view.embeds(),
                 "ephemeral": True,
             }
-            if assist_view is not None:
-                send_kwargs["view"] = assist_view
-            await interaction.followup.send(**send_kwargs)
+            if len(results) > result_view.page_size:
+                send_kwargs["view"] = result_view
+            if interaction.response.is_done():
+                await interaction.followup.send(**send_kwargs)
+            else:
+                await interaction.response.send_message(**send_kwargs)
 
-        class PlayerNameModal(ui.Modal, title="Player Name"):
+        class PlayerAndPriceModal(ui.Modal, title="Player & Price"):
             def __init__(self, parent_view):
                 super().__init__()
                 self.parent_view = parent_view
@@ -1427,43 +1535,56 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     placeholder="Luka Doncic",
                     default=str(parent_view.player_name or "")[:4000],
                     required=True,
+                    max_length=120,
+                )
+                self.price = ui.TextInput(
+                    label="Listing Price (Optional for Assist)",
+                    placeholder="Leave blank until after Price Assist",
+                    default="" if parent_view.price is None else f"{parent_view.price:.2f}",
+                    required=False,
+                    max_length=20,
+                )
+                self.rarity = ui.TextInput(
+                    label="Rarity",
+                    placeholder="Common, Rare, Super Rare...",
+                    default=str(parent_view.card_rarity or "")[:40],
+                    required=False,
+                    max_length=40,
+                )
+                self.notes = ui.TextInput(
+                    label="Notes / Additional Information",
+                    placeholder="Debut, career high, ROTY, award...",
+                    default=str(parent_view.additional_information or "")[:300],
+                    required=False,
+                    max_length=300,
                 )
                 self.add_item(self.player_name)
+                self.add_item(self.price)
+                self.add_item(self.rarity)
+                self.add_item(self.notes)
 
             async def on_submit(self, interaction: discord.Interaction):
                 player_name = normalize_player_name(self.player_name.value)
                 if not player_name:
                     await interaction.response.send_message("Player name is required.", ephemeral=True)
                     return
+                price_text = str(self.price.value or "").strip()
+                price = None
+                if price_text:
+                    try:
+                        price = parse_required_float(price_text, field_name="Price")
+                    except ValueError as exc:
+                        await interaction.response.send_message(str(exc), ephemeral=True)
+                        return
+                    if price <= 0:
+                        await interaction.response.send_message("Price must be greater than 0.", ephemeral=True)
+                        return
 
                 self.parent_view.player_name = player_name
-                await update_listing_review(interaction, self.parent_view)
-
-        class ListingPriceModal(ui.Modal, title="Listing Price"):
-            def __init__(self, parent_view):
-                super().__init__()
-                self.parent_view = parent_view
-                self.price = ui.TextInput(
-                    label="Listing Price",
-                    placeholder="25.00",
-                    default="" if parent_view.price is None else f"{parent_view.price:.2f}",
-                    required=True,
-                )
-                self.add_item(self.price)
-
-            async def on_submit(self, interaction: discord.Interaction):
-                try:
-                    price = float(str(self.price.value).replace("$", "").replace(",", "").strip())
-                except (TypeError, ValueError):
-                    await interaction.response.send_message("Price must be a number, like 25.00.", ephemeral=True)
-                    return
-                if price <= 0:
-                    await interaction.response.send_message("Price must be greater than 0.", ephemeral=True)
-                    return
-
                 self.parent_view.price = price
+                self.parent_view.card_rarity = str(self.rarity.value or "").strip().title() or None
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
                 await update_listing_review(interaction, self.parent_view)
-                await send_listing_price_assist(interaction, self.parent_view)
 
         class ListPlayerView(ui.View):
             def __init__(self, bot, db, sale_channel, image_url, image_bytes, metadata_guess):
@@ -1478,8 +1599,6 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.metadata_guess = metadata_guess
                 self.player_name = metadata_guess.player_name
                 self.price = None
-                self.image_was_cropped = metadata_guess.image_was_cropped
-
                 self.set_optional = False
                 self.subset_required = True
                 self.set_value = metadata_guess.set_name
@@ -1488,6 +1607,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_value = metadata_guess.subset_value
                 self.card_count_value = metadata_guess.card_count
                 self.card_rarity = metadata_guess.card_rarity
+                self.additional_information = None
                 self.set_option_order = metadata_guess.set_option_order
                 self.subset_option_order = metadata_guess.subset_option_order
                 self.variant_option_order = metadata_guess.variant_option_order
@@ -1547,21 +1667,21 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
 
                 add_search_buttons(self, row=4)
 
-                self.price_button = ui.Button(
-                    label="💵 Set Price",
+                self.player_price_button = ui.Button(
+                    label="✏️ Player & Price",
                     style=discord.ButtonStyle.blurple,
                     row=4,
                 )
-                self.price_button.callback = self.on_set_price
-                self.add_item(self.price_button)
+                self.player_price_button.callback = self.on_edit_player_and_price
+                self.add_item(self.player_price_button)
 
-                self.player_button = ui.Button(
-                    label="✏️ Edit Player",
-                    style=discord.ButtonStyle.blurple,
+                self.price_assist_button = ui.Button(
+                    label="💡 Price Assist",
+                    style=discord.ButtonStyle.secondary,
                     row=4,
                 )
-                self.player_button.callback = self.on_edit_player
-                self.add_item(self.player_button)
+                self.price_assist_button.callback = self.on_price_assist
+                self.add_item(self.price_assist_button)
 
                 self.submit_button = ui.Button(
                     label="🏷️ Create Listing",
@@ -1590,15 +1710,20 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ]
                 if self.card_rarity:
                     details.append(f"Rarity: **{self.card_rarity}**")
-                if self.price is not None:
-                    details.append(f"Price: **{_format_price(self.price)}**")
+                if self.additional_information:
+                    details.append(f"Notes: **{self.additional_information}**")
+                details.append(
+                    f"Price: **{_format_price(self.price)}**"
+                    if self.price is not None
+                    else "Price: **Needs entry before creating**"
+                )
                 return "\n".join(details)
 
-            async def on_set_price(self, interaction: discord.Interaction):
-                await interaction.response.send_modal(ListingPriceModal(self))
+            async def on_edit_player_and_price(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(PlayerAndPriceModal(self))
 
-            async def on_edit_player(self, interaction: discord.Interaction):
-                await interaction.response.send_modal(PlayerNameModal(self))
+            async def on_price_assist(self, interaction: discord.Interaction):
+                await send_listing_price_assist(interaction, self)
 
             async def create_listing(self, interaction: discord.Interaction, listing_data: dict):
                 if not interaction.response.is_done():
@@ -1636,7 +1761,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     await _edit_listing_workflow_error(
                         interaction,
                         self,
-                        "Use Edit Player and Set Price before submitting.",
+                        "Use Player & Price before submitting.",
                     )
                     return
                 if not self.set_value or not self.subset_value or not self.card_count_value:
@@ -1667,6 +1792,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     "subset": self.subset_value,
                     "card_count": self.card_count_value,
                     "card_rarity": self.card_rarity,
+                    "additional_information": self.additional_information,
                     "price": self.price,
                     "date_time": format_sheet_datetime(),
                     "seller": interaction.user,
@@ -1681,6 +1807,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     return
 
                 listing_data["payment_methods"] = payment_methods
+                profile = self.db.get_marketplace_profile(interaction.user.id) or {}
+                listing_data["payment_notes"] = profile.get("payment_notes")
                 await self.create_listing(interaction, listing_data)
                 return
 
@@ -1709,7 +1837,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "No image was received.",
             )
             await interaction.followup.send(
-                "No image was received, so the listing was not started. Use List Player again when you are ready to upload.",
+                "An image is required, so the listing was not started. Use List Player again when you are ready to upload.",
                 ephemeral=True,
             )
             return
@@ -1718,15 +1846,12 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             "Image received. Reading card details...",
         )
         ocr_started_at = time.perf_counter()
-        metadata_guess, processed_image_bytes, image_was_cropped = await asyncio.to_thread(
+        metadata_guess = await asyncio.to_thread(
             _extract_listing_metadata_for_review,
             image_bytes,
             _get_known_player_names(db),
         )
         ocr_elapsed_ms = int((time.perf_counter() - ocr_started_at) * 1000)
-        if processed_image_bytes:
-            image_bytes = processed_image_bytes
-        metadata_guess.image_was_cropped = image_was_cropped
         log_marketplace_event(
             db,
             "listing_ocr_processed",
@@ -1741,7 +1866,6 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "card_count_source": metadata_guess.card_count_source,
                 "card_rarity": metadata_guess.card_rarity,
                 "card_rarity_source": metadata_guess.card_rarity_source,
-                "image_was_cropped": image_was_cropped,
                 "elapsed_ms": ocr_elapsed_ms,
                 "confidence": metadata_guess.confidence,
             },
@@ -1767,6 +1891,418 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     ephemeral=True,
                 )
 
+    async def list_a_set(interaction: discord.Interaction):
+        profile_ready, _profile = marketplace_profile_status(
+            db,
+            interaction.user.id,
+            require_payments=True,
+        )
+        if not profile_ready:
+            async def resume_listing(profile_interaction: discord.Interaction) -> None:
+                await list_a_set(profile_interaction)
+
+            await interaction.response.send_modal(
+                MarketplaceProfileModal(
+                    db,
+                    interaction.user.id,
+                    bot=bot,
+                    require_payments=True,
+                    after_save=resume_listing,
+                )
+            )
+            return
+
+        upload_sessions = getattr(bot, "listing_upload_sessions", None)
+        if upload_sessions is None:
+            upload_sessions = set()
+            bot.listing_upload_sessions = upload_sessions
+        upload_session_key = (interaction.user.id, interaction.channel_id)
+        if upload_session_key in upload_sessions:
+            await interaction.response.send_message(
+                "You already have a listing image upload in progress in this channel.",
+                ephemeral=True,
+            )
+            return
+        upload_sessions.add(upload_session_key)
+
+        sale_channel = bot.get_channel(bot.sale_channel_id)
+        if sale_channel is None:
+            try:
+                sale_channel = await bot.fetch_channel(bot.sale_channel_id)
+            except Exception as exc:
+                LOGGER.error("Could not fetch sale channel: %s", exc)
+                sale_channel = None
+
+        class SetDetailsModal(ui.Modal, title="Set Listing Details"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.set_name = ui.TextInput(
+                    label="Set Name",
+                    default=str(parent_view.set_name or "")[:120],
+                    required=True,
+                    max_length=120,
+                )
+                self.subset = ui.TextInput(
+                    label="Subset",
+                    default=str(parent_view.subset or "")[:120],
+                    required=True,
+                    max_length=120,
+                )
+                self.card_rarity = ui.TextInput(
+                    label="Rarity",
+                    default=str(parent_view.card_rarity or "")[:40],
+                    required=True,
+                    max_length=40,
+                )
+                self.price = ui.TextInput(
+                    label="Listing Price",
+                    placeholder="25.00",
+                    default="" if parent_view.price is None else f"{parent_view.price:.2f}",
+                    required=True,
+                    max_length=20,
+                )
+                self.notes = ui.TextInput(label="Notes / Additional Information", required=False, default=str(parent_view.additional_information or "")[:300], max_length=300)
+                for item in (self.set_name, self.subset, self.card_rarity, self.price, self.notes):
+                    self.add_item(item)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                try:
+                    price = parse_required_float(self.price.value, field_name="Price")
+                    if price <= 0:
+                        raise ValueError("Price must be greater than 0.")
+                except ValueError as exc:
+                    await interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                self.parent_view.set_name = str(self.set_name.value).strip()
+                self.parent_view.subset = str(self.subset.value).strip()
+                self.parent_view.card_rarity = str(self.card_rarity.value).strip().title()
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
+                self.parent_view.price = price
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class SetProgressModal(ui.Modal, title="Set Progress"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.cards_owned = ui.TextInput(
+                    label="Cards Owned",
+                    placeholder="30",
+                    default="" if parent_view.cards_owned is None else str(parent_view.cards_owned),
+                    required=True,
+                    max_length=5,
+                )
+                self.cards_total = ui.TextInput(
+                    label="Cards Total",
+                    placeholder="30",
+                    default="" if parent_view.cards_total is None else str(parent_view.cards_total),
+                    required=True,
+                    max_length=5,
+                )
+                self.add_item(self.cards_owned)
+                self.add_item(self.cards_total)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                try:
+                    cards_owned = int(str(self.cards_owned.value).strip())
+                    cards_total = int(str(self.cards_total.value).strip())
+                    if cards_owned < 0 or cards_total <= 0:
+                        raise ValueError
+                    if cards_owned > cards_total:
+                        await interaction.response.send_message(
+                            "Cards owned cannot be greater than cards total.",
+                            ephemeral=True,
+                        )
+                        return
+                except (TypeError, ValueError):
+                    await interaction.response.send_message(
+                        "Cards owned and cards total must be valid whole numbers.",
+                        ephemeral=True,
+                    )
+                    return
+                self.parent_view.cards_owned = cards_owned
+                self.parent_view.cards_total = cards_total
+                if self.parent_view.is_complete:
+                    self.parent_view.missing_cards = ""
+                self.parent_view.sync_items()
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class MissingCardsModal(ui.Modal, title="Missing Cards"):
+            def __init__(self, parent_view):
+                super().__init__()
+                self.parent_view = parent_view
+                self.missing_cards = ui.TextInput(
+                    label="Missing Cards",
+                    placeholder="List the cards missing from this set",
+                    default=str(parent_view.missing_cards or "")[:1000],
+                    required=False,
+                    max_length=1000,
+                    style=discord.TextStyle.paragraph,
+                )
+                self.add_item(self.missing_cards)
+
+            async def on_submit(self, interaction: discord.Interaction):
+                self.parent_view.missing_cards = str(self.missing_cards.value or "").strip()
+                await interaction.response.edit_message(
+                    content=self.parent_view.selected_summary(),
+                    view=self.parent_view,
+                )
+
+        class ListSetView(ui.View):
+            def __init__(self, image_url, image_bytes, metadata_guess):
+                super().__init__(timeout=300)
+                self.image_url = image_url
+                self.image_bytes = image_bytes
+                self.image_filename = "set_image.png"
+                self.set_name = metadata_guess.set_name
+                self.subset = metadata_guess.subset
+                self.card_rarity = metadata_guess.card_rarity
+                self.cards_owned = metadata_guess.cards_owned
+                self.cards_total = metadata_guess.cards_total
+                self.price = None
+                self.includes_award = False
+                self.missing_cards = ""
+                self.additional_information = None
+                self.review_message = None
+
+                self.details_button = ui.Button(
+                    label="✏️ Set Details",
+                    style=discord.ButtonStyle.blurple,
+                    row=0,
+                )
+                self.details_button.callback = self.on_details
+                self.progress_button = ui.Button(
+                    label="📊 Set Progress",
+                    style=discord.ButtonStyle.secondary,
+                    row=0,
+                )
+                self.progress_button.callback = self.on_progress
+                self.award_button = ui.Button(row=1)
+                self.award_button.callback = self.on_award_toggle
+                self.missing_button = ui.Button(
+                    label="📝 Missing Cards",
+                    style=discord.ButtonStyle.secondary,
+                    row=1,
+                )
+                self.missing_button.callback = self.on_missing_cards
+                self.submit_button = ui.Button(
+                    label="🏷️ Create Set Listing",
+                    style=discord.ButtonStyle.green,
+                    row=2,
+                )
+                self.submit_button.callback = self.on_submit
+                self.sync_items()
+
+            @property
+            def is_complete(self) -> bool:
+                return (
+                    self.cards_owned is not None
+                    and self.cards_total is not None
+                    and self.cards_total > 0
+                    and self.cards_owned >= self.cards_total
+                )
+
+            def sync_items(self) -> None:
+                self.clear_items()
+                self.award_button.label = (
+                    "🏆 Includes Award: Yes"
+                    if self.includes_award
+                    else "🏆 Includes Award: No"
+                )
+                self.award_button.style = (
+                    discord.ButtonStyle.green
+                    if self.includes_award
+                    else discord.ButtonStyle.secondary
+                )
+                self.add_item(self.details_button)
+                self.add_item(self.progress_button)
+                self.add_item(self.award_button)
+                if not self.is_complete:
+                    self.add_item(self.missing_button)
+                self.add_item(self.submit_button)
+
+            def selected_summary(self) -> str:
+                progress = (
+                    f"{self.cards_owned}/{self.cards_total} cards"
+                    if self.cards_owned is not None and self.cards_total is not None
+                    else "Needs entry"
+                )
+                lines = [
+                    "**Review set listing details**",
+                    f"Set: **{self.set_name or 'Needs entry'}**",
+                    f"Subset: **{self.subset or 'Needs entry'}**",
+                    f"Rarity: **{self.card_rarity or 'Needs entry'}**",
+                    f"Progress: **{progress}**",
+                    f"Status: **{'Complete' if self.is_complete else 'Incomplete'}**",
+                    f"Includes Award: **{'Yes' if self.includes_award else 'No'}**",
+                ]
+                if not self.is_complete:
+                    lines.append(f"Missing Cards: **{self.missing_cards or 'Not provided'}**")
+                if self.additional_information:
+                    lines.append(f"Notes: **{self.additional_information}**")
+                lines.append(
+                    f"Price: **{_format_price(self.price)}**"
+                    if self.price is not None
+                    else "Price: **Needs entry before creating**"
+                )
+                return "\n".join(lines)
+
+            async def on_details(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(SetDetailsModal(self))
+
+            async def on_progress(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(SetProgressModal(self))
+
+            async def on_missing_cards(self, interaction: discord.Interaction):
+                await interaction.response.send_modal(MissingCardsModal(self))
+
+            async def on_award_toggle(self, interaction: discord.Interaction):
+                self.includes_award = not self.includes_award
+                self.sync_items()
+                await interaction.response.edit_message(
+                    content=self.selected_summary(),
+                    view=self,
+                )
+
+            async def on_submit(self, interaction: discord.Interaction):
+                if not self.set_name or not self.subset or not self.card_rarity or self.price is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Use Set Details and provide the set, subset, rarity, and price.",
+                    )
+                    return
+                if self.cards_owned is None or self.cards_total is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Use Set Progress before submitting.",
+                    )
+                    return
+                if sale_channel is None:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Sale channel is not configured or could not be found. Please contact an admin.",
+                    )
+                    return
+
+                payment_methods = db.get_seller_payment_methods(interaction.user.id)
+                if not payment_methods:
+                    await _edit_listing_workflow_error(
+                        interaction,
+                        self,
+                        "Add payment accounts in Account before creating this listing.",
+                    )
+                    return
+                profile = db.get_marketplace_profile(interaction.user.id) or {}
+                listing_data = {
+                    "listing_kind": LISTING_KIND_SET,
+                    "player_names": self.set_name,
+                    "set_name": self.set_name,
+                    "subset": self.subset,
+                    "card_count": self.cards_total,
+                    "card_rarity": self.card_rarity,
+                    "set_cards_owned": self.cards_owned,
+                    "set_cards_total": self.cards_total,
+                    "includes_award": self.includes_award,
+                    "missing_cards": "" if self.is_complete else self.missing_cards,
+                    "additional_information": self.additional_information,
+                    "price": self.price,
+                    "date_time": format_sheet_datetime(),
+                    "seller": interaction.user,
+                    "seller_id": interaction.user.id,
+                    "status": "active",
+                    "image_url": None,
+                    "bids": [],
+                    "payment_methods": payment_methods,
+                    "payment_notes": profile.get("payment_notes"),
+                }
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+                image_file = None
+                if self.image_bytes:
+                    image_file = discord.File(io.BytesIO(self.image_bytes), filename=self.image_filename)
+                    listing_data["image_url"] = f"attachment://{self.image_filename}"
+                    listing_data["image_bytes"] = self.image_bytes
+                    listing_data["image_filename"] = self.image_filename
+                else:
+                    listing_data["image_url"] = self.image_url
+                await publish_listing(
+                    bot,
+                    db,
+                    sale_channel,
+                    interaction,
+                    listing_data,
+                    image_file=image_file,
+                    notify_users=False,
+                )
+                await _finish_listing_workflow_message(interaction, self.review_message)
+                self.stop()
+
+        await interaction.response.send_message(
+            "Please upload the set image in this channel within 2 minutes.",
+            ephemeral=True,
+        )
+        try:
+            image_url, _image_file, image_bytes = await collect_listing_image(
+                bot,
+                db,
+                interaction,
+                None,
+            )
+        finally:
+            upload_sessions.discard(upload_session_key)
+
+        if not image_bytes and not image_url:
+            await _edit_original_workflow_status(interaction, "No image was received.")
+            await interaction.followup.send(
+                "An image is required, so the set listing was not started. Use List a Set when you are ready to upload.",
+                ephemeral=True,
+            )
+            return
+
+        await _edit_original_workflow_status(interaction, "Image received. Reading set details...")
+        ocr_started_at = time.perf_counter()
+        metadata_guess = await asyncio.to_thread(extract_set_listing_metadata, image_bytes)
+        ocr_elapsed_ms = int((time.perf_counter() - ocr_started_at) * 1000)
+        log_marketplace_event(
+            db,
+            "set_listing_ocr_processed",
+            user_id=interaction.user.id,
+            details={
+                "engine": metadata_guess.engine,
+                "ocr_available": metadata_guess.ocr_available,
+                "set_name": metadata_guess.set_name,
+                "subset": metadata_guess.subset,
+                "card_rarity": metadata_guess.card_rarity,
+                "cards_owned": metadata_guess.cards_owned,
+                "cards_total": metadata_guess.cards_total,
+                "elapsed_ms": ocr_elapsed_ms,
+                "confidence": metadata_guess.confidence,
+            },
+        )
+        view = ListSetView(image_url, image_bytes, metadata_guess)
+        try:
+            view.review_message = await interaction.edit_original_response(
+                content=view.selected_summary(),
+                view=view,
+            )
+        except discord.DiscordException:
+            view.review_message = await interaction.followup.send(
+                view.selected_summary(),
+                view=view,
+                ephemeral=True,
+                wait=True,
+            )
+
+
     async def auction_a_player(
         interaction: discord.Interaction,
         player_name: str = None,
@@ -1774,6 +2310,32 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         duration_hours: int = 24,
         bid_increment: float = 1.0,
     ):
+        profile_ready, _profile = marketplace_profile_status(
+            db,
+            interaction.user.id,
+            require_payments=True,
+        )
+        if not profile_ready:
+            async def resume_auction(profile_interaction: discord.Interaction) -> None:
+                await auction_a_player(
+                    profile_interaction,
+                    player_name=player_name,
+                    starting_price=starting_price,
+                    duration_hours=duration_hours,
+                    bid_increment=bid_increment,
+                )
+
+            await interaction.response.send_modal(
+                MarketplaceProfileModal(
+                    db,
+                    interaction.user.id,
+                    bot=bot,
+                    require_payments=True,
+                    after_save=resume_auction,
+                )
+            )
+            return
+
         player_name = normalize_player_name(player_name)
         if starting_price is not None and starting_price <= 0:
             await interaction.response.send_message("Starting price must be greater than 0.", ephemeral=True)
@@ -1787,7 +2349,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             await interaction.response.send_message("Bid increment must be greater than 0.", ephemeral=True)
             return
 
-        auction_channel = await bot.fetch_channel_safely(bot.auction_surface_channel_id)
+        auction_channel = await bot.fetch_channel_safely(bot.auction_channel_id)
         if auction_channel is None:
             log_marketplace_event(
                 db,
@@ -1848,8 +2410,13 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     placeholder="Luka Doncic",
                     default=str(parent_view.player_name or "")[:4000],
                     required=True,
+                    max_length=120,
                 )
+                self.rarity = ui.TextInput(label="Rarity", required=False, default=str(parent_view.card_rarity or "")[:40], max_length=40)
+                self.notes = ui.TextInput(label="Notes / Additional Information", required=False, default=str(parent_view.additional_information or "")[:300], max_length=300)
                 self.add_item(self.player_name)
+                self.add_item(self.rarity)
+                self.add_item(self.notes)
 
             async def on_submit(self, interaction: discord.Interaction):
                 player_name = normalize_player_name(self.player_name.value)
@@ -1858,6 +2425,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     return
 
                 self.parent_view.player_name = player_name
+                self.parent_view.card_rarity = str(self.rarity.value or "").strip().title() or None
+                self.parent_view.additional_information = str(self.notes.value or "").strip() or None
                 try:
                     await interaction.response.edit_message(
                         content=self.parent_view.selected_summary(),
@@ -1901,14 +2470,15 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
 
             async def on_submit(self, interaction: discord.Interaction):
                 try:
-                    starting_price = float(str(self.starting_price.value).replace("$", "").replace(",", "").strip())
+                    starting_price = parse_required_float(str(self.starting_price.value), field_name="Starting price")
+                    bid_increment = parse_required_float(str(self.bid_increment.value), field_name="Bid increment")
+                except ValueError as exc:
+                    await interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                try:
                     duration_hours = int(str(self.duration_hours.value).strip())
-                    bid_increment = float(str(self.bid_increment.value).replace("$", "").replace(",", "").strip())
                 except (TypeError, ValueError):
-                    await interaction.response.send_message(
-                        "Starting price, duration, and bid increment must be valid numbers.",
-                        ephemeral=True,
-                    )
+                    await interaction.response.send_message("Duration must be a whole number of hours.", ephemeral=True)
                     return
                 if starting_price <= 0:
                     await interaction.response.send_message("Starting price must be greater than 0.", ephemeral=True)
@@ -1961,7 +2531,6 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.starting_price = starting_price
                 self.duration_hours = duration_hours
                 self.bid_increment = bid_increment
-                self.image_was_cropped = metadata_guess.image_was_cropped
                 self.set_optional = False
                 self.subset_required = True
                 self.set_value = metadata_guess.set_name
@@ -1970,6 +2539,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.subset_value = metadata_guess.subset_value
                 self.card_count_value = metadata_guess.card_count
                 self.card_rarity = metadata_guess.card_rarity
+                self.additional_information = None
                 self.set_option_order = metadata_guess.set_option_order
                 self.subset_option_order = metadata_guess.subset_option_order
                 self.variant_option_order = metadata_guess.variant_option_order
@@ -2011,7 +2581,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 self.add_item(self.variant_select)
 
                 self.card_count_select = ui.Select(
-                    placeholder="Optional: Select Card Count",
+                    placeholder="Select Card Count",
                     options=build_card_count_options(
                         selected_value=(
                             str(self.card_count_value)
@@ -2074,6 +2644,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ]
                 if self.card_rarity:
                     details.append(f"Rarity: **{self.card_rarity}**")
+                if self.additional_information:
+                    details.append(f"Notes: **{self.additional_information}**")
                 return "\n".join(details)
 
             async def on_edit_player(self, interaction: discord.Interaction):
@@ -2146,6 +2718,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     "subset": self.subset_value,
                     "card_count": self.card_count_value,
                     "card_rarity": self.card_rarity,
+                    "additional_information": self.additional_information,
                     "price": self.starting_price,
                     "starting_price": self.starting_price,
                     "bid_increment": self.bid_increment,
@@ -2163,6 +2736,8 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                     return
 
                 listing_data["payment_methods"] = payment_methods
+                profile = self.db.get_marketplace_profile(interaction.user.id) or {}
+                listing_data["payment_notes"] = profile.get("payment_notes")
                 await self.create_auction(interaction, listing_data)
 
         await interaction.response.send_message(
@@ -2190,7 +2765,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "No image was received.",
             )
             await interaction.followup.send(
-                "No image was received, so the auction was not started. Use Auction Player again when you are ready to upload.",
+                "An image is required, so the auction was not started. Use Auction Player again when you are ready to upload.",
                 ephemeral=True,
             )
             return
@@ -2200,15 +2775,12 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
             "Image received. Reading card details...",
         )
         ocr_started_at = time.perf_counter()
-        metadata_guess, processed_image_bytes, image_was_cropped = await asyncio.to_thread(
+        metadata_guess = await asyncio.to_thread(
             _extract_listing_metadata_for_review,
             image_bytes,
             _get_known_player_names(db),
         )
         ocr_elapsed_ms = int((time.perf_counter() - ocr_started_at) * 1000)
-        if processed_image_bytes:
-            image_bytes = processed_image_bytes
-        metadata_guess.image_was_cropped = image_was_cropped
         log_marketplace_event(
             db,
             "auction_ocr_processed",
@@ -2224,7 +2796,6 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 "card_count_source": metadata_guess.card_count_source,
                 "card_rarity": metadata_guess.card_rarity,
                 "card_rarity_source": metadata_guess.card_rarity_source,
-                "image_was_cropped": image_was_cropped,
                 "elapsed_ms": ocr_elapsed_ms,
                 "confidence": metadata_guess.confidence,
             },
@@ -2441,7 +3012,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 await interaction.response.edit_message(content=self.selected_summary(), view=self)
 
             async def on_variant_select(self, interaction: discord.Interaction):
-                selected = self.variant_select.values[0]
+                selected = decode_variant_value(self.variant_select.values[0])
                 if selected in {"select_subset_first", "no_variants"}:
                     await interaction.response.edit_message(content=self.selected_summary(), view=self)
                     return
@@ -2492,6 +3063,7 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         def __init__(self, owner_id: int):
             super().__init__(timeout=180)
             self.owner_id = owner_id
+            self.page = 0
 
         async def _reject_wrong_user(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id == self.owner_id:
@@ -2514,30 +3086,245 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 return
             await remove_notify(interaction)
 
-    def _notification_hub_content(user_id: int) -> str:
+        @ui.button(label="⬅️ Alerts", style=discord.ButtonStyle.secondary, custom_id="nba_bot:notification_prev", row=1)
+        async def previous_page_button(self, interaction: discord.Interaction, button: ui.Button):
+            if await self._reject_wrong_user(interaction):
+                return
+            self.page = max(0, self.page - 1)
+            await interaction.response.edit_message(content=_notification_hub_content(self.owner_id, self.page), view=self)
+
+        @ui.button(label="Alerts ➡️", style=discord.ButtonStyle.secondary, custom_id="nba_bot:notification_next", row=1)
+        async def next_page_button(self, interaction: discord.Interaction, button: ui.Button):
+            if await self._reject_wrong_user(interaction):
+                return
+            rule_count = len(_get_active_notify_rules_for_user(bot, self.owner_id))
+            max_page = max(0, (rule_count + 24) // 25 - 1)
+            self.page = min(max_page, self.page + 1)
+            await interaction.response.edit_message(content=_notification_hub_content(self.owner_id, self.page), view=self)
+
+    def _notification_hub_content(user_id: int, page: int = 0) -> str:
         notify_rules = _get_active_notify_rules_for_user(bot, user_id)
+        page_count = max(1, (len(notify_rules) + 24) // 25)
+        page = min(max(0, page), page_count - 1)
         lines = [
             "## 🔔 Notifications",
             "Your active notification alerts:",
             "",
         ]
         if notify_rules:
-            lines.extend(_notify_rule_line(rule) for rule in notify_rules[:25])
-            if len(notify_rules) > 25:
-                lines.append(f"\nShowing 25 of {len(notify_rules)} active notifications.")
+            page_rules = notify_rules[page * 25:page * 25 + 25]
+            lines.extend(_notify_rule_line(rule) for rule in page_rules)
+            lines.append(f"\nPage {page + 1}/{page_count} — {len(notify_rules)} active notifications.")
         else:
             lines.append("No active notifications yet.")
         return "\n".join(lines)
 
+    def _is_moderator(interaction: discord.Interaction) -> bool:
+        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+        return bool(
+            permissions
+            and (
+                getattr(permissions, "manage_guild", False)
+                or getattr(permissions, "manage_messages", False)
+                or getattr(permissions, "administrator", False)
+            )
+        )
+
+    class AddSetModal(ui.Modal, title="Add or Update Card Set"):
+        def __init__(self):
+            super().__init__()
+            self.set_name = ui.TextInput(label="Set Name", placeholder="2026-27 Topps Chrome", max_length=100)
+            self.subsets = ui.TextInput(
+                label="Subsets (one per line or comma-separated)",
+                placeholder="Base, Gold, Signatures",
+                style=discord.TextStyle.paragraph,
+                max_length=1500,
+            )
+            self.add_item(self.set_name)
+            self.add_item(self.subsets)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            if not _is_moderator(interaction):
+                await interaction.response.send_message("Only moderators can add sets.", ephemeral=True)
+                return
+            set_name = str(self.set_name.value or "").strip()
+            subset_values = [
+                value.strip()
+                for line in str(self.subsets.value or "").splitlines()
+                for value in line.split(",")
+                if value.strip()
+            ]
+            try:
+                register_custom_set(set_name, subset_values)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            db.upsert_custom_set(set_name, subset_values, interaction.user.id)
+            log_marketplace_event(db, "custom_set_upserted", user_id=interaction.user.id, details={"set_name": set_name, "subsets": subset_values})
+            await interaction.response.send_message(
+                f"Saved **{set_name}** with {len(subset_values)} subset(s). It is available immediately.",
+                ephemeral=True,
+            )
+
+    def _showcase_embed(card: dict, index: int, total: int) -> discord.Embed:
+        details = []
+        if card.get("set_name"):
+            details.append(f"Set: {card['set_name']}")
+        if card.get("additional_information"):
+            details.append(f"Notes: {card['additional_information']}")
+        embed = discord.Embed(
+            title=f"✨ {card.get('player_names') or 'Showcase Card'}"[:256],
+            description="\n".join(details) or "A favorite from this collector's collection.",
+            color=discord.Color.purple(),
+        )
+        embed.set_footer(text=f"Showcased by {card.get('owner_name') or 'Collector'} | Card {index + 1} of {total}")
+        embed.set_image(url=f"attachment://showcase_{card['id']}.png")
+        return embed
+
+    class ShowcaseDetailsModal(ui.Modal, title="Add Showcase Card"):
+        def __init__(self, owner_view):
+            super().__init__()
+            self.owner_view = owner_view
+            self.player_names = ui.TextInput(label="Player / Card Name", max_length=120)
+            self.set_name = ui.TextInput(label="Set", required=False, max_length=120)
+            self.notes = ui.TextInput(label="Notes", placeholder="Why this card is special", required=False, style=discord.TextStyle.paragraph, max_length=500)
+            self.add_item(self.player_names)
+            self.add_item(self.set_name)
+            self.add_item(self.notes)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            if len(db.get_showcase_cards(interaction.user.id)) >= 5:
+                await interaction.response.send_message("Your showcase already has 5 cards. Remove one before adding another.", ephemeral=True)
+                return
+            await interaction.response.send_message("Upload the card image in this channel within 2 minutes.", ephemeral=True)
+            try:
+                prompt = await interaction.original_response()
+            except discord.DiscordException:
+                prompt = None
+            _url, _file, image_bytes = await collect_listing_image(bot, db, interaction, prompt)
+            if not image_bytes:
+                return
+            try:
+                db.add_showcase_card(
+                    interaction.user.id,
+                    getattr(interaction.user, "display_name", None) or interaction.user.name,
+                    normalize_player_name(self.player_names.value) or str(self.player_names.value).strip(),
+                    str(self.set_name.value or "").strip(),
+                    str(self.notes.value or "").strip(),
+                    image_bytes,
+                )
+            except ValueError as exc:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
+            log_marketplace_event(db, "showcase_card_added", user_id=interaction.user.id)
+            await interaction.followup.send("Card added to your showcase.", ephemeral=True)
+
+    class ShowcaseCarouselView(ui.View):
+        def __init__(self, owner_id: int):
+            super().__init__(timeout=300)
+            self.owner_id = owner_id
+            self.cards = db.get_showcase_cards()
+            self.index = 0
+            self._sync()
+
+        def _sync(self):
+            self.cards = db.get_showcase_cards()
+            if self.cards:
+                self.index = min(self.index, len(self.cards) - 1)
+            else:
+                self.index = 0
+            for child in self.children:
+                if getattr(child, "custom_id", "") in {"showcase:prev", "showcase:next"}:
+                    child.disabled = len(self.cards) <= 1
+                if getattr(child, "custom_id", "") == "showcase:remove":
+                    child.disabled = not self.cards
+
+        def kwargs(self) -> dict:
+            self._sync()
+            if not self.cards:
+                return {"embed": discord.Embed(title="✨ Collector Showcase", description="No cards have been showcased yet.", color=discord.Color.purple())}
+            card = self.cards[self.index]
+            file = discord.File(io.BytesIO(card["image_blob"]), filename=f"showcase_{card['id']}.png")
+            return {"embed": _showcase_embed(card, self.index, len(self.cards)), "file": file}
+
+        async def _edit(self, interaction: discord.Interaction):
+            kwargs = self.kwargs()
+            attachments = [kwargs["file"]] if kwargs.get("file") else []
+            await interaction.response.edit_message(embed=kwargs["embed"], attachments=attachments, view=self)
+
+        @ui.button(label="⬅️ Previous", style=discord.ButtonStyle.secondary, custom_id="showcase:prev", row=0)
+        async def previous(self, interaction: discord.Interaction, button: ui.Button):
+            if self.cards:
+                self.index = (self.index - 1) % len(self.cards)
+            await self._edit(interaction)
+
+        @ui.button(label="Next ➡️", style=discord.ButtonStyle.secondary, custom_id="showcase:next", row=0)
+        async def next(self, interaction: discord.Interaction, button: ui.Button):
+            if self.cards:
+                self.index = (self.index + 1) % len(self.cards)
+            await self._edit(interaction)
+
+        @ui.button(label="➕ Add Mine", style=discord.ButtonStyle.green, custom_id="showcase:add", row=1)
+        async def add(self, interaction: discord.Interaction, button: ui.Button):
+            await interaction.response.send_modal(ShowcaseDetailsModal(self))
+
+        @ui.button(label="🗑️ Remove Mine", style=discord.ButtonStyle.red, custom_id="showcase:remove", row=1)
+        async def remove(self, interaction: discord.Interaction, button: ui.Button):
+            if not self.cards:
+                await interaction.response.send_message("There is no showcase card to remove.", ephemeral=True)
+                return
+            card = self.cards[self.index]
+            if int(card["user_id"]) != interaction.user.id and not _is_moderator(interaction):
+                await interaction.response.send_message("You can only remove your own showcase cards.", ephemeral=True)
+                return
+            db.delete_showcase_card(card["id"])
+            log_marketplace_event(db, "showcase_card_removed", user_id=interaction.user.id, details={"card_id": card["id"]})
+            await self._edit(interaction)
+
     class BotInterfaceView(ui.View):
         def __init__(self):
             super().__init__(timeout=None)
+            button_order = [
+                "nba_bot:price",
+                "nba_bot:open_marketplace",
+                "nba_bot:showcase",
+                "nba_bot:notifications",
+                "nba_bot:list_player",
+                "nba_bot:list_set",
+                "nba_bot:auction_player",
+                "nba_bot:help",
+                "nba_bot:profile",
+                "nba_bot:status",
+                "nba_bot:add_set",
+            ]
+            buttons = {
+                child.custom_id: child
+                for child in self.children
+                if getattr(child, "custom_id", None)
+            }
+            self.clear_items()
+            for custom_id in button_order:
+                self.add_item(buttons[custom_id])
 
-        @ui.button(label="🏷️ List Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=1)
+        async def interaction_check(self, interaction: discord.Interaction) -> bool:
+            nba_bot_channel = await bot.resolve_nba_bot_channel()
+            if nba_bot_channel is not None and interaction.channel_id == nba_bot_channel.id:
+                return True
+            await interaction.response.send_message(
+                "Use the NBA Bot buttons in the #nba-bot channel.",
+                ephemeral=True,
+            )
+            return False
+
+        @ui.button(label="🏷️ List a Player", style=discord.ButtonStyle.green, custom_id="nba_bot:list_player", row=1)
         async def list_player_button(self, interaction: discord.Interaction, button: ui.Button):
             await list_a_player(interaction)
 
-        @ui.button(label="🔨 Auction Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=1)
+        @ui.button(label="📚 List a Set", style=discord.ButtonStyle.green, custom_id="nba_bot:list_set", row=1)
+        async def list_set_button(self, interaction: discord.Interaction, button: ui.Button):
+            await list_a_set(interaction)
+
+        @ui.button(label="🔨 Auction a Player", style=discord.ButtonStyle.green, custom_id="nba_bot:auction_player", row=1)
         async def auction_player_button(self, interaction: discord.Interaction, button: ui.Button):
             await auction_a_player(interaction)
 
@@ -2545,11 +3332,24 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
         async def price_button(self, interaction: discord.Interaction, button: ui.Button):
             await price(interaction)
 
-        @ui.button(label="📊 View Status", style=discord.ButtonStyle.blurple, custom_id="nba_bot:status", row=3)
+        @ui.button(label="📊 View Status", style=discord.ButtonStyle.secondary, custom_id="nba_bot:status", row=2)
         async def status_button(self, interaction: discord.Interaction, button: ui.Button):
             await status(interaction)
 
-        @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=3)
+        @ui.button(label="✨ Showcase", style=discord.ButtonStyle.blurple, custom_id="nba_bot:showcase", row=0)
+        async def showcase_button(self, interaction: discord.Interaction, button: ui.Button):
+            view = ShowcaseCarouselView(interaction.user.id)
+            kwargs = view.kwargs()
+            await interaction.response.send_message(**kwargs, view=view, ephemeral=True)
+
+        @ui.button(label="🛠️ Add Set (Mods)", style=discord.ButtonStyle.secondary, custom_id="nba_bot:add_set", row=3)
+        async def add_set_button(self, interaction: discord.Interaction, button: ui.Button):
+            if not _is_moderator(interaction):
+                await interaction.response.send_message("Only moderators can add or update sets.", ephemeral=True)
+                return
+            await interaction.response.send_modal(AddSetModal())
+
+        @ui.button(label=f"🔔 Notifications{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:notifications", row=0)
         async def notifications_button(self, interaction: discord.Interaction, button: ui.Button):
             await interaction.response.send_message(
                 _notification_hub_content(interaction.user.id),
@@ -2557,13 +3357,35 @@ def register_bot_interface(bot: "NBACollectBot", sheet: PriceSheet, db: CardData
                 ephemeral=True,
             )
 
-        @ui.button(label="❓ Get Help", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=4)
+        @ui.button(label="❓ Help & Feedback", style=discord.ButtonStyle.secondary, custom_id="nba_bot:help", row=2)
         async def help_button(self, interaction: discord.Interaction, button: ui.Button):
             await help_command(interaction)
 
-        @ui.button(label=f"💬 Leave Feedback{BUTTON_PAD}", style=discord.ButtonStyle.secondary, custom_id="nba_bot:feedback", row=4)
-        async def feedback_button(self, interaction: discord.Interaction, button: ui.Button):
-            await feedback(interaction)
+        @ui.button(label="👤 Account", style=discord.ButtonStyle.secondary, custom_id="nba_bot:profile", row=2)
+        async def profile_button(self, interaction: discord.Interaction, button: ui.Button):
+            profile_ready, _profile = marketplace_profile_status(db, interaction.user.id)
+            if not profile_ready:
+                async def show_profile(profile_interaction: discord.Interaction) -> None:
+                    await profile_interaction.response.send_message(
+                        marketplace_profile_content(db, profile_interaction.user.id),
+                        view=MarketplaceProfileView(db, profile_interaction.user.id, bot=bot),
+                        ephemeral=True,
+                    )
+
+                await interaction.response.send_modal(
+                    MarketplaceProfileModal(
+                        db,
+                        interaction.user.id,
+                        bot=bot,
+                        after_save=show_profile,
+                    )
+                )
+                return
+            await interaction.response.send_message(
+                marketplace_profile_content(db, interaction.user.id),
+                view=MarketplaceProfileView(db, interaction.user.id, bot=bot),
+                ephemeral=True,
+            )
 
         @ui.button(label=f"🛒 Marketplace{BUTTON_PAD * 2}", style=discord.ButtonStyle.blurple, custom_id="nba_bot:open_marketplace", row=0)
         async def open_marketplace_button(self, interaction: discord.Interaction, button: ui.Button):

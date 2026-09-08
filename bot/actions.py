@@ -1,10 +1,12 @@
 import asyncio
 import io
+from datetime import datetime, timezone
 
 import discord
 
 from parsers import listing_matches_notify_rule
 from logger import LOGGER, log_marketplace_event
+from marketplace import is_set_listing
 from price_assist import build_price_assist
 from serializers import build_listing_embed
 
@@ -72,7 +74,7 @@ async def collect_listing_image(
                 level=30,
             )
             await interaction.followup.send(
-                "That file was not detected as an image. Listing will continue without an image.",
+                "That file was not detected as an image. An image is required, so this workflow will stop.",
                 ephemeral=True,
             )
         else:
@@ -102,7 +104,7 @@ async def collect_listing_image(
             level=30,
         )
         await interaction.followup.send(
-            "No image uploaded. Continuing without image.",
+            "No image was uploaded. An image is required, so this workflow will stop.",
             ephemeral=True,
         )
     finally:
@@ -124,9 +126,15 @@ async def publish_listing(
 ) -> discord.Message:
     from views import AuctionActionView, ListingActionView
 
+    seller_id = listing_data.get("seller_id")
+    profile = (db.get_marketplace_profile(seller_id) or {}) if seller_id else {}
+    if profile.get("payment_methods"):
+        listing_data["payment_methods"] = profile["payment_methods"]
+    listing_data["payment_notes"] = profile.get("payment_notes")
+    listing_data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
     view_cls = AuctionActionView if listing_data.get("listing_type") == "auction" else ListingActionView
     view = view_cls(bot, db, listing_data)
-    if listing_data.get("listing_type") != "auction":
+    if listing_data.get("listing_type") != "auction" and not is_set_listing(listing_data):
         listing_data["price_assist"] = build_price_assist(getattr(bot, "sheet", None) or db, listing_data)
         log_marketplace_event(
             db,
@@ -194,6 +202,7 @@ async def publish_listing(
             "player_names": listing_data.get("player_names"),
             "price": listing_data.get("price"),
             "listing_type": listing_data.get("listing_type", "sale"),
+            "listing_kind": listing_data.get("listing_kind", "player"),
         },
     )
     if notify_users:
@@ -209,19 +218,36 @@ async def notify_matching_users(bot, listing_data: dict):
         and listing_matches_notify_rule(listing_data, rule)
     ]
 
-    for rule in matching_rules:
-        user = await bot.hydrate_user(rule["user_id"], fetch=True)
+    matching_user_ids = sorted({int(rule["user_id"]) for rule in matching_rules})
+    listing_link = None
+    if listing_data.get("guild_id") and listing_data.get("channel_id") and listing_data.get("message_id"):
+        listing_link = (
+            f"https://discord.com/channels/{listing_data['guild_id']}/"
+            f"{listing_data['channel_id']}/{listing_data['message_id']}"
+        )
+
+    for user_id in matching_user_ids:
+        user = await bot.hydrate_user(user_id, fetch=True)
 
         sent = await bot.safe_dm_user(
             user,
             content=(
                 f"🔔 New listing match!\n\n"
-            f"**Player:** {listing_data['player_names']}\n"
-            f"**Set:** {listing_data['set_name']}\n"
-            f"**Subset:** {listing_data['subset']}\n"
-            f"**Card Count:** /{listing_data['card_count']}\n"
-            f"**Price:** ${listing_data['price']:.2f}\n\n"
+                f"**Player:** {listing_data['player_names']}\n"
+                f"**Set:** {listing_data['set_name']}\n"
+                f"**Subset:** {listing_data['subset']}\n"
+                f"**Card Count:** /{listing_data['card_count']}\n"
+                f"**Price:** ${listing_data['price']:.2f}\n"
+                f"{f'**Open listing:** {listing_link}' if listing_link else 'Open the NBA Bot Marketplace to view this listing.'}\n\n"
             ),
         )
         if not sent:
-            LOGGER.warning(f"Could not DM user {rule['user_id']}")
+            LOGGER.warning("Could not DM user %s", user_id)
+        else:
+            log_marketplace_event(
+                bot.db,
+                "listing_notification_sent",
+                user_id=user_id,
+                listing_id=listing_data.get("message_id"),
+                details={"matching_rule_count": sum(1 for rule in matching_rules if int(rule["user_id"]) == user_id)},
+            )

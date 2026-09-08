@@ -70,6 +70,8 @@ def query_price_source(
     cc=None,
     subset: str | None = None,
     limit: int = 50,
+    card_rarity: str | None = None,
+    additional_information: str | None = None,
 ) -> list[dict[str, Any]]:
     if source is None or not hasattr(source, "query_player"):
         return []
@@ -82,6 +84,8 @@ def query_price_source(
                 cc=cc,
                 subset=subset,
                 limit=limit,
+                card_rarity=card_rarity,
+                additional_information=additional_information,
             )
         )
     except TypeError:
@@ -100,6 +104,7 @@ def build_price_assist(source, listing_data: dict[str, Any]) -> dict[str, Any]:
     set_name = str(listing_data.get("set_name") or "").strip()
     subset = str(listing_data.get("subset") or "").strip()
     card_count = _normalize_card_count_for_query(listing_data.get("card_count"))
+    card_rarity = str(listing_data.get("card_rarity") or "").strip() or None
     include_topps_now_similars = _is_topps_now_set(set_name)
 
     exact_candidates = query_price_source(
@@ -107,6 +112,8 @@ def build_price_assist(source, listing_data: dict[str, Any]) -> dict[str, Any]:
         player_name=player_name or None,
         set_name=set_name or None,
         subset=subset or None,
+        cc=card_count,
+        card_rarity=card_rarity,
         limit=50,
     )
     normalized_player = _normalize_text(player_name)
@@ -279,6 +286,18 @@ class PriceResultsView(ui.View):
                 value=latest.get("date_time", "Unknown Date"),
                 inline=True,
             )
+            if latest.get("card_rarity"):
+                embed.add_field(
+                    name="Rarity",
+                    value=str(latest.get("card_rarity")),
+                    inline=True,
+                )
+            if latest.get("additional_information"):
+                embed.add_field(
+                    name="Notes",
+                    value=str(latest.get("additional_information"))[:1024],
+                    inline=False,
+                )
             embeds.append(embed)
         return embeds
 
